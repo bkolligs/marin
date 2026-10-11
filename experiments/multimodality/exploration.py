@@ -4,18 +4,19 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "marimo==0.25.1",
+#     "marimo>=0.23.3",
 #     "torch==2.11.0",
 #     "transformers==5.12.1",
 #     "pillow>=12.2.0",
 #     "pyarrow==23.0.1",
 #     "matplotlib",
+#     "huggingface-hub==1.33.0",
 # ]
 # ///
 
 import marimo
 
-__generated_with = "0.25.1"
+__generated_with = "0.24.2"
 app = marimo.App(width="medium")
 
 with app.setup:
@@ -24,12 +25,10 @@ with app.setup:
     import hashlib
     import json
     import platform
-    import subprocess
     import tempfile
     from collections.abc import Iterator
     from contextlib import closing
     from dataclasses import dataclass
-    from enum import StrEnum
     from importlib.metadata import version
     from io import BytesIO
     from pathlib import Path
@@ -39,176 +38,57 @@ with app.setup:
     import torch
     import torch.nn.functional as F
     from huggingface_hub import HfApi, HfFileSystem
-    from PIL import Image, ImageDraw
+    from PIL import Image
     from pyarrow.parquet import ParquetFile
-    from tokenizers import Tokenizer
-    from tokenizers.models import WordLevel
-    from tokenizers.pre_tokenizers import Whitespace
     from torch import nn
-    from transformers import (
-        AutoModelForCausalLM,
-        AutoTokenizer,
-        CLIPImageProcessorPil,
-        CLIPVisionConfig,
-        CLIPVisionModel,
-        PreTrainedTokenizerFast,
-        Qwen3Config,
-        Qwen3ForCausalLM,
-    )
+    from transformers import AutoModelForCausalLM, AutoTokenizer, SiglipImageProcessor, SiglipVisionModel
 
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    # Build a VLM: explain it, implement it, test it
+    mo.md(r"""
+    # Build a VLM with Delphi + SigLIP
+
+    Connect a frozen SigLIP vision encoder to the frozen Delphi 998M language model. Train only a small
+    projector that turns image features into LM input embeddings.
+
+    Work through data loading, tokenization, embedding alignment, next-token prediction and loss, training,
+    and further experiments. Each exercise introduces the background you need, then leaves the core code for you.
+    Replace the marked `NotImplementedError` statements and inspect the supplied shapes and checks.
 
     Tracking: [Marin #9524](https://github.com/marin-community/marin/issues/9524).
-
-    A vision-language model (VLM) predicts text using images and text as context. You will connect a frozen CLIP
-    vision encoder to a frozen Delphi 998M language model by training a small multilayer perceptron (MLP), called a
-    projector. Hugging Face provides the transformer internals. You implement the boundaries between them.
-
-    ## How to work through this notebook
-
-    Use this Feynman-method cycle for **each of the eight exercises (0-7)**:
-
-    1. **Explain:** fill in the Markdown answer cell (edit its `mo.md` source) in words you could use with a
-    programmer who has never trained a VLM. Define technical terms instead of hiding behind them.
-    2. **Predict:** write the expected shape, behavior, or result before running code.
-    3. **Implement:** replace the marked `raise NotImplementedError(...)` statements. Most functions need one to
-    ten lines. Setup, data creation, plotting, and saving are provided.
-    4. **Test:** run the exercise cell and its checks. A passing assertion verifies behavior, not your explanation.
-    5. **Teach back:** revise your original explanation, identify a mistaken prediction, and explain why the
-    observed behavior follows from the implementation. If you cannot explain it, reduce the example and retry.
-
-    An unfinished exercise blocks its dependent cells. Independent Markdown remains readable. **There is no
-    automatic solution mode or complete answer key in this notebook.** Folded explanations are hints; attempt your
-    own explanation before opening them. You may consult API documentation for syntax.
-
-    Start with `RunMode.SMOKE`, which uses tiny random models without network access. After all exercises pass,
-    restart the marimo session, select `RunMode.PRETRAINED`, and rerun with pinned Delphi/CLIP checkpoints. Smoke
-    results check mechanics, not pretrained-model quality.
-
-    The selected alignment dataset is **LLaVA 558K image-caption pairs**. Pretrained mode streams a bounded sample;
-    offline smoke mode uses four colored squares as a mechanics check. Neither the small sample nor the smoke task
-    establishes general visual question answering (VQA). This PyTorch prototype does not launch Iris jobs or
-    reproduce Marin's JAX/Levanter training stack. The base model needs no preceding text-only instruction-tuning
-    phase for this exercise.
-    """
-    )
+    """)
     return
 
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    ## 1. Open this notebook in marimo
+    mo.md(r"""
+    ## Setup
 
-    On [molab](https://molab.marimo.io), open this Python notebook and enable a GPU using the notebook specs
-    button in the app header. See [molab's GPU instructions](https://marimo.io/blog/reintroducing-molab).
-    The Config cell defaults to `device="cuda"` and checks GPU access before you load models. Start with
-    `RunMode.SMOKE`, then switch to `RunMode.PRETRAINED` after completing the exercises.
-
-    For local use, set `device="cpu"` if needed and launch from the repository root:
+    Open this file in [molab](https://molab.marimo.io) and enable a GPU, or run locally:
 
     ```bash
     uv run --no-project --with 'marimo==0.25.1' marimo edit --sandbox experiments/multimodality/exploration.py
     ```
 
-    The Python file declares its dependencies in a script metadata header. Marimo's sandbox uses an isolated
-    environment, avoiding the full Marin training environment. Choose **lazy execution** in marimo's runtime
-    settings while working through exercises: editing a cell marks dependent cells stale until you choose to run
-    them.
-
-    The **Load models**, **Load examples**, **Train projector**, **Generate answers**, and **Save projector**
-    buttons gate expensive work. Opening the notebook does not download models or data. Independent exercise
-    instructions remain readable even while an unfinished code cell raises `NotImplementedError`.
-
-    Edit the Config cell to select `RunMode.PRETRAINED` for pinned Delphi/CLIP weights and the bounded LLaVA
-    sample; this downloads gigabytes of weights on first use. CUDA requires a compatible PyTorch installation.
-    CPU works but the pretrained exercise is slow. On molab, the fork checkout and saved weights live on the
-    remote runtime. Export your notebook edits and saved projector before ending the session.
-
-    Write teach-back answers by editing the corresponding Markdown cell's `mo.md` string; they persist in this
-    Python file. Marimo runs cells by dependency, not visual position. Cell-local scratch variables begin with `_`.
-    The baseline `projector` is never trained in place: training returns a separate `trained_projector`, and
-    generation/saving consume that result. Click the relevant run buttons again after changing an upstream
-    exercise.
-    """
-    )
+    Use lazy execution while editing exercises. Set `Config.device` to `cuda` for a GPU or `cpu` locally.
+    Model and data downloads start only when you click their buttons. The pretrained weights require gigabytes
+    of downloads; CPU training will be slow. Export your notebook edits and projector before ending a remote session.
+    """)
     return
 
 
 @app.cell
 def _():
-    clone_fork = mo.ui.run_button(label="Download Marin fork")
-    mo.output.append(
-        mo.vstack(
-            [
-                mo.md(
-                    "### Download the Marin source for later exploration\n\n"
-                    "Click to clone [bkolligs/marin](https://github.com/bkolligs/marin/tree/main), "
-                    "using a shallow checkout of `main`. Git must be installed. "
-                    "To choose another destination, edit `marin_fork_path` in the next cell before clicking. "
-                    "Repeat clicks reuse the checkout without pulling or overwriting edits. "
-                    "This downloads source code only; it does not install Marin or change the VLM backbones."
-                ),
-                clone_fork,
-            ]
-        )
-    )
-    return (clone_fork,)
-
-
-@app.cell
-def _(clone_fork):
-    mo.stop(not clone_fork.value, mo.md("Click **Download Marin fork** when you need the source."))
-    marin_fork_path = Path.home() / "marin-notebook-repos" / "bkolligs-marin"
-    _fork_url = "https://github.com/bkolligs/marin.git"
-    if marin_fork_path.exists():
-        if not (marin_fork_path / ".git").exists():
-            raise ValueError(f"Destination exists but is not a Git checkout: {marin_fork_path}")
-        _origin = subprocess.run(
-            ["git", "-C", str(marin_fork_path), "remote", "get-url", "origin"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        if _origin != _fork_url:
-            raise ValueError(f"Expected origin {_fork_url}, found {_origin}. Choose another destination.")
-    else:
-        marin_fork_path.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            ["git", "clone", "--depth", "1", "--single-branch", "--branch", "main", _fork_url, str(marin_fork_path)],
-            check=True,
-        )
-    marin_fork_commit = subprocess.run(
-        ["git", "-C", str(marin_fork_path), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    print(f"Marin source: {marin_fork_path}\nChecked-out commit: {marin_fork_commit}")
-    return marin_fork_commit, marin_fork_path
-
-
-@app.cell
-def _():
-
-    class RunMode(StrEnum):
-        PRETRAINED = "pretrained"
-        SMOKE = "smoke"
 
     @dataclass(frozen=True)
     class Config:
-        mode: RunMode = RunMode.SMOKE
-        device: str = "cuda"  # Set to "cpu" for local exploration without a GPU.
+        device: str = "cpu"  # Set to "cpu" for local exploration without a GPU.
         lm_id: str = "marin-community/delphi-3e20-998Mparams-49.8Btokens"
         lm_revision: str = "9b913fac63d36a80424949775c63c728ac8fa9fc"
-        vision_id: str = "openai/clip-vit-base-patch32"
-        vision_revision: str = "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268"
+        vision_id: str = "google/siglip-base-patch16-224"
+        vision_revision: str = "7fd15f0689c79d79e38b1c2e2e2370a7bf2761ed"
         seed: int = 42
         learning_rate: float = 1e-3
         steps: int = 40
@@ -240,30 +120,23 @@ def _():
         )
     # BF16 reduces CUDA activation/weight memory. CPU uses FP32 for portability.
     lm_dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
-    print(dataclasses.asdict(cfg))
-    print({name: version(name) for name in ("torch", "transformers", "pillow", "pyarrow", "huggingface-hub")})
-    return RunMode, cfg, device, lm_dtype
+    print(cfg)
+    return cfg, device, lm_dtype
 
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    ## 2. Load the parts and inspect their interfaces
+    mo.md(r"""
+    ## Checkpoints
 
-    Delphi is a **base** model: it learned next-token prediction on text. The chosen checkpoint has about 998M
-    parameters, hidden width 1536, and a Llama 3 vocabulary even though its architecture is Qwen3. Always load the
-    tokenizer shipped with the checkpoint.
+    Delphi is a base language model trained to predict the next text token. Load its own tokenizer.
+    SigLIP converts a processed 224 x 224 image into a 14 x 14 grid of patch vectors: `[B, 196, 768]`.
+    Here `B` is batch size. Its final hidden states contain patches without a classification (CLS) token.
+    Keep all 196 positions; avoid the pooled output.
 
-    CLIP ViT-B/32 resizes/crops to 224x224 pixels. Its patch stem makes a 7x7 grid of 32x32 patches. The vision
-    transformer adds one classification (CLS) token, giving 50 vectors of width 768. We will keep the 49 patch
-    vectors and remove CLS. These vectors are contextual: each has already attended to the other patches.
-
-    The tiny branch is only setup for offline verification. Both branches feed the same implementation below. Exact
-    model revisions are pinned so later runs use the same weights. Loading this base model does not require a chat
-    template.
-    """
-    )
+    Both backbones stay frozen. The projector will map the vision width to Delphi's hidden width.
+    The checkpoint revisions below fix which weights and preprocessing this study uses.
+    """)
     return
 
 
@@ -275,69 +148,15 @@ def _():
 
 
 @app.cell
-def _(RunMode, cfg, device, lm_dtype, load_models):
+def _(cfg, device, lm_dtype, load_models):
     mo.stop(not load_models.value, mo.md("Click **Load models** when ready."))
     torch.manual_seed(cfg.seed)
-    if cfg.mode == RunMode.PRETRAINED:
-        tokenizer = AutoTokenizer.from_pretrained(cfg.lm_id, revision=cfg.lm_revision)
-        lm = AutoModelForCausalLM.from_pretrained(
-            cfg.lm_id, revision=cfg.lm_revision, dtype=lm_dtype, attn_implementation="eager"
-        )
-        processor = CLIPImageProcessorPil.from_pretrained(cfg.vision_id, revision=cfg.vision_revision)
-        vision = CLIPVisionModel.from_pretrained(cfg.vision_id, revision=cfg.vision_revision)
-    else:
-        words = [
-            "[PAD]",
-            "[UNK]",
-            "[BOS]",
-            "[EOS]",
-            "What",
-            "color",
-            "is",
-            "the",
-            "square",
-            "?",
-            "Answer",
-            ":",
-            "red",
-            "green",
-            "blue",
-            "yellow",
-        ]
-        backend = Tokenizer(WordLevel({word: i for i, word in enumerate(words)}, unk_token="[UNK]"))
-        backend.pre_tokenizer = Whitespace()
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_object=backend,
-            pad_token="[PAD]",
-            unk_token="[UNK]",
-            bos_token="[BOS]",
-            eos_token="[EOS]",
-        )
-        lm = Qwen3ForCausalLM(
-            Qwen3Config(
-                vocab_size=len(words),
-                hidden_size=64,
-                intermediate_size=128,
-                num_hidden_layers=2,
-                num_attention_heads=4,
-                num_key_value_heads=2,
-                head_dim=16,
-                max_position_embeddings=256,
-                attention_dropout=0.0,
-            )
-        )
-        vision = CLIPVisionModel(
-            CLIPVisionConfig(
-                hidden_size=32,
-                intermediate_size=64,
-                num_hidden_layers=2,
-                num_attention_heads=4,
-                image_size=32,
-                patch_size=8,
-            )
-        )
-        processor = CLIPImageProcessorPil(size={"shortest_edge": 32}, crop_size={"height": 32, "width": 32})
-
+    tokenizer = AutoTokenizer.from_pretrained(cfg.lm_id, revision=cfg.lm_revision)
+    lm = AutoModelForCausalLM.from_pretrained(
+        cfg.lm_id, revision=cfg.lm_revision, dtype=lm_dtype, attn_implementation="eager"
+    )
+    processor = SiglipImageProcessor.from_pretrained(cfg.vision_id, revision=cfg.vision_revision)
+    vision = SiglipVisionModel.from_pretrained(cfg.vision_id, revision=cfg.vision_revision)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     assert tokenizer.bos_token_id is not None and tokenizer.eos_token_id is not None
@@ -350,115 +169,82 @@ def _(RunMode, cfg, device, lm_dtype, load_models):
     return lm, processor, tokenizer, vision
 
 
-@app.cell(hide_code=True)
-def _():
-    mo.md(
-        r"""
-    ## 3. Use LLaVA 558K for caption alignment
-
-    The source is [liuhaotian/LLaVA-Pretrain](https://huggingface.co/datasets/liuhaotian/LLaVA-Pretrain), the 558K
-    alignment set, not the 665K instruction mixture or the re-captioned ReCap set. Its original distribution
-    separates image archives from conversation JSON.
-
-    For streaming, we use
-    [theblackcat102/llava-pretrain](https://huggingface.co/datasets/theblackcat102/llava-pretrain), a community
-    Parquet copy with **558,128 rows**, embedded image bytes, and JSON-encoded `conversations`. Its revision is
-    pinned above. We verified its row count/schema and bounded streaming, not full-corpus equivalence to the
-    original release. Record this exact source in experiment results.
-
-    Pretrained mode reads at most `stream_scan_rows` rows and retains 8 training images and 4 held-out images by
-    default. The provided bounded Parquet iterator uses HTTP range reads and avoids materializing the full
-    approximately 28 GB repository. Parquet range reads can fetch an entire row group; `stream_scan_rows=32` bounds
-    rows, not network bytes. This is **streamed sampling followed by a small in-memory exercise**, not full-corpus
-    streaming training.
-
-    We split by SHA-256 of the encoded image bytes before selecting examples: about one fifth map to held-out. This
-    keeps byte-identical images in one split, even if their captions differ. It does not detect visually identical
-    images with different encodings. The first rows are not a representative shuffled validation set; results are
-    learning diagnostics only.
-
-    Each row contains a human request and a `gpt` caption. We supervise the caption. For this experiment we replace
-    the varied requests with a fixed prompt, “Describe this image. Caption:”, so the only distinguishing input is
-    the image. We represent images through embeddings; the literal `<image>` marker is not passed as a text token.
-
-    Smoke mode remains offline and uses colored-square targets. To use real captions, restart with
-    `RunMode.PRETRAINED`; the tiny smoke tokenizer has no useful natural-language vocabulary. The training and
-    masking exercises are shared. Captions can be noisy and several descriptions can be valid: inspect examples and
-    use caption loss plus wrong-image controls, not exact string match as the quality score.
-
-    The provided loader uses Hugging Face file access plus PyArrow record batches. Threaded Parquet reads continued
-    after early stopping during validation, so it uses synchronous reads (`use_threads=False`, `pre_buffer=False`)
-    and closes the generator and file handles explicitly. This is supplied I/O boilerplate; the exercises focus on
-    targets and the model. Revisit buffering when building full-corpus training.
-    """
-    )
+@app.cell
+def _(tokenizer):
+    print("Vocabulary size:", len(tokenizer))
     return
 
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    ## Exercise 0: identify what the model should learn
+    mo.md(r"""
+    ## 1. Data loading
 
-    **Explain:** In an image-caption pair stored as a conversation, which text should the model predict? Why should
-    `<image>` and the human request not become caption targets?
+    We use a bounded sample of [LLaVA image-caption pairs](https://huggingface.co/datasets/theblackcat102/llava-pretrain).
+    Each row contains encoded image bytes and a human/gpt conversation. The human turn supplies a request;
+    the gpt turn supplies the caption target. Images become embeddings, so `<image>` is never a caption target.
 
-    **Predict:** Inspect the small fixture below. Write the exact output string your parser should return. Explain
-    why lazily streaming rows does not imply zero buffering or zero image downloads.
+    The supplied loader reads Parquet batches with HTTP range requests and retains a small in-memory sample.
+    `stream_scan_rows` bounds inspected rows, but a read can fetch a whole row group. Image-byte hashes assign
+    examples to training or held-out splits and keep identical bytes together. Different encodings of the same
+    image can still cross splits. This small first-row sample is a learning diagnostic.
 
-    **Implement:** Complete `caption_target`: parse the JSON string, require exactly two turns in human → gpt
-    order, and return the nonempty assistant caption with surrounding whitespace removed. Raise `ValueError` for
-    wrong roles/turn count or an empty caption; do not silently drop malformed rows. Invalid JSON can propagate its
-    parsing error.
-
-    **Test and revise:** Run the checks, then explain why holding out rows independently could leak the same image
-    into both splits. What duplicate images would the provided byte-hash split fail to catch?
-    """
-    )
+    Every image uses the same prompt, `Describe this image. Caption:`.
+    """)
     return
 
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    ### Your explanation and predictions — edit this cell
+    mo.md(r"""
+    ### Exercise: extract a caption
 
-    **First explanation:** [Teach the input/target distinction in plain language.]
+    Background: supervised learning needs an input and a target. Here the image and fixed prompt are inputs;
+    the assistant caption is the target. The loader decodes JSON when needed before passing a list of turns.
 
-    **Prediction:** [Write the fixture's caption and explain streaming versus caching.]
+    Code: implement `caption_target` to require two turns in human → gpt order and return the stripped,
+    nonempty caption. Your existing implementation is kept below. Run the fixture checks and inspect the images.
+    """)
+    return
 
-    **What actually happened:** [Complete after the checks and data preview.]
 
-    **Gap I discovered:** [Name one assumption about labels, images, or splitting.]
-
-    **Revised explanation:** [Explain the data path without using “streaming” as a substitute for its mechanics.]
-    """
-    )
+@app.cell(hide_code=True)
+def _():
+    mo.md(r"""
+    Your data notes: The model should predict the caption text when provided the image.
+    `<image>` and the human request are inputs, so they should not be caption targets.
+    Fixture prediction: "A red square on a white background."
+    """)
     return
 
 
 @app.cell
 def _():
-    def caption_target(conversations: str) -> str:
-        """Extract the caption from one LLaVA human/gpt conversation JSON string."""
-        raise NotImplementedError("Exercise 0: validate the two turns and extract the caption")
+    def caption_target(conversations: list[dict]) -> str:
+        """Extract the caption from one LLaVA human/gpt conversation."""
+        if len(conversations) != 2:
+            raise ValueError("There need to be two turns in this conversation")
+        if ["human", "gpt"] != [conv["from"] for conv in conversations]:
+            raise ValueError("Turn must only contain human and GPT in that order")
 
-    fixture = json.dumps(
-        [
-            {"from": "human", "value": "<image>\nDescribe this image."},
-            {"from": "gpt", "value": "  A red square on a white background.  "},
-        ]
-    )
+        gpt_turn = conversations[1]["value"].strip()
+        if not gpt_turn:
+            raise ValueError("Empty turn")
+        return gpt_turn
+
+    fixture = [
+        {"from": "human", "value": "<image>\nDescribe this image."},
+        {"from": "gpt", "value": "  A red square on a white background.  "},
+    ]
     assert caption_target(fixture) == "A red square on a white background."
     for turns in (
         [{"from": "human", "value": "<image>"}],
         [{"from": "gpt", "value": "wrong first role"}, {"from": "human", "value": "wrong target"}],
         [{"from": "human", "value": "<image>"}, {"from": "gpt", "value": " "}],
+        [{"from": "human", "value": "<image>"}, {"from": "human", "value": " "}],
     ):
         try:
-            caption_target(json.dumps(turns))
+            caption_target(turns)
         except ValueError:
             pass  # This check requires an explicit failure, not silent row loss.
         else:
@@ -475,7 +261,7 @@ def _():
 
 
 @app.cell
-def _(RunMode, caption_target, cfg, load_examples):
+def _(caption_target, cfg, load_examples):
     mo.stop(not load_examples.value, mo.md("Click **Load examples** after completing Exercise 0."))
 
     @dataclass(frozen=True)
@@ -484,16 +270,7 @@ def _(RunMode, caption_target, cfg, load_examples):
         answer: str
         source_id: str
 
-    COLORS = ("red", "green", "blue", "yellow")
-    PROMPT = "What color is the square? Answer:" if cfg.mode == RunMode.SMOKE else "Describe this image. Caption:"
-
-    def square_examples(box: tuple[int, int, int, int]) -> list[Example]:
-        examples = []
-        for color in COLORS:
-            image = Image.new("RGB", (224, 224), "white")
-            ImageDraw.Draw(image).rectangle(box, fill=color)
-            examples.append(Example(image, color, hashlib.sha256(image.tobytes()).hexdigest()))
-        return examples
+    PROMPT = "Describe this image. Caption:"
 
     def stream_llava_rows(limit: int) -> Iterator[dict]:
         """Read a bounded sequence of Parquet rows using synchronous HTTP range reads."""
@@ -528,7 +305,8 @@ def _(RunMode, caption_target, cfg, load_examples):
                 limit = cfg.heldout_examples if is_heldout else cfg.train_examples
                 if len(destination) == limit:
                     continue  # Keep byte-identical images once, irrespective of their captions.
-                caption = caption_target(row["conversations"])
+                turns = row["conversations"]
+                caption = caption_target(json.loads(turns) if isinstance(turns, str) else turns)
                 with Image.open(BytesIO(raw)) as image:
                     destination.append(Example(image.convert("RGB"), caption, identity))
         if len(train) != cfg.train_examples or len(heldout) != cfg.heldout_examples:
@@ -536,12 +314,8 @@ def _(RunMode, caption_target, cfg, load_examples):
         assert {item.source_id for item in train}.isdisjoint(item.source_id for item in heldout)
         return (train, heldout)
 
-    if cfg.mode == RunMode.SMOKE:
-        train_examples = square_examples((48, 48, 176, 176))
-        heldout_examples = square_examples((22, 74, 118, 170))
-    else:
-        train_examples, heldout_examples = llava_examples()
-    print("Source:", "offline colored squares" if cfg.mode == RunMode.SMOKE else cfg.dataset_id)
+    train_examples, heldout_examples = llava_examples()
+    print("Source:", cfg.dataset_id)
     print("Retained train / held-out:", len(train_examples), len(heldout_examples))
     _fig, _axes = plt.subplots(2, 4, figsize=(10, 5))
     for _row, examples in enumerate((train_examples, heldout_examples)):
@@ -558,74 +332,104 @@ def _(RunMode, caption_target, cfg, load_examples):
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    ## Exercise 1: Keep the image information
+    mo.md(r"""
+    ## 2. Tokenization
 
-    **Explain first:** Explain how an image becomes a sequence of vectors. What does the extra classification token
-    represent? Why could averaging all vectors hide information needed later?
+    Background: the checkpoint tokenizer maps text to vocabulary IDs, which the LM embedding table maps
+    to vectors. A word can span several tokens. We tokenize the prompt and caption separately to define
+    their boundary, add beginning-of-sequence (BOS) ourselves, and append end-of-sequence (EOS) to each caption.
+    EOS teaches the LM when to stop. The leading caption space separates text from the prompt ending `Caption:`.
 
-    **Predict before running:** Predict the full vision output shape and selected patch shape for the current mode.
-    Derive the patch count from image size and patch size.
-
-    **Implement:** Complete `select_patch_features`. The processor and encoder call are supplied.
-
-    **After the checks:** Describe what changed when you removed one sequence position, and what would change if
-    you accidentally removed one batch item.
-    """
-    )
+    Code: complete `caption_ids` with the Delphi tokenizer, `add_special_tokens=False`, and a leading
+    space before the caption. Append exactly one EOS ID. Inspect IDs and decoded text below.
+    """)
     return
+
+
+@app.cell
+def _(train_examples):
+    train_examples[0].answer
+    return
+
+
+@app.cell
+def _(lm, tokenizer):
+    text = "The pteradactyl is"
+    tokenized_text = tokenizer(text=text, return_tensors="pt").to(lm.device)
+    print(tokenized_text)
+    prediction = lm.generate(**tokenized_text)
+    print(prediction)
+    print(tokenizer.batch_decode(prediction)[0])
+    return (prediction,)
+
+
+@app.cell
+def _(prediction, tokenizer):
+    tokenizer.decode(prediction[:, -4:])
+    return
+
+
+@app.cell
+def _(tokenizer):
+    tokenizer.decode(466)
+    return
+
+
+@app.cell
+def _(tokenizer):
+    tokenizer.vocab["EOS"]
+    return
+
+
+@app.cell
+def _(tokenizer):
+    tokenizer.bos_token_id
+    return
+
+
+@app.cell
+def _(tokenizer, train_examples):
+    def caption_ids(caption: str) -> list[int]:
+        """Tokenize a leading-space caption and append EOS."""
+        tokens =  [*tokenizer(" " + caption, add_special_tokens=False).input_ids, tokenizer.eos_token_id]
+        return tokens
+    _caption = train_examples[0].answer
+    _ids = caption_ids(_caption)
+    print(_ids, [*tokenizer(" " + _caption, add_special_tokens=False).input_ids, tokenizer.eos_token_id])
+    assert _ids == [*tokenizer(" " + _caption, add_special_tokens=False).input_ids, tokenizer.eos_token_id]
+    print("Caption:", _caption)
+    print("IDs:", _ids)
+    print("Decoded:", tokenizer.decode(_ids))
+    return (caption_ids,)
 
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    ### Your explanation and predictions — edit this cell
+    mo.md(r"""
+    ### Exercise: retain image patches
 
-    **First explanation:** [Write 3-5 plain-language sentences.]
+    Background: the processor normalizes pixels and returns `[B, 3, 224, 224]`. SigLIP's vision transformer
+    returns `[B, 196, 768]` contextual patch features. Each patch has already attended to the other patches.
+    There is no CLS position to remove. Averaging patches loses their separate spatial positions.
 
-    **Prediction:** [Write shapes or expected behavior, with your reasoning.]
-
-    **What actually happened:** [Fill this in after running the checks.]
-
-    **Gap I discovered:** [State what you misunderstood or what the checks did not establish.]
-
-    **Revised explanation:** [Teach the idea again in simpler words, using a concrete example.]
-    """
-    )
+    Code: complete `select_patch_features` to keep every patch in order. The processor call, frozen encoder,
+    and feature cache are supplied. `no_grad()` is appropriate for this frozen feature extraction.
+    """)
     return
 
 
-@app.cell(hide_code=True)
-def _():
-    mo.md(
-        r"""
-    <details>
-    <summary>Explanation hint — open after your first attempt</summary>
-
-    ## 4. Turn pixels into a sequence of visual features
-
-    The processor converts PIL images to `[batch, channels, height, width]`, rescales pixel values, and normalizes
-    channels using CLIP's preprocessing. The encoder returns `[batch, patches + 1, vision_width]`. Slicing `[:, 1:,
-    :]` removes CLS; it does not average patches.
-
-    We cache the **final hidden-state patch features** because the encoder is frozen and there is no random
-    augmentation. This saves rerunning CLIP on every step. `no_grad()` is appropriate here: we do not need
-    gradients into the encoder or pixels. If we later train the vision encoder, this cache must be removed and
-    features recomputed with gradients.
-
-    </details>
-    """
-    )
+@app.cell
+def _(vision):
+    print("Patch count: ", (vision.config.image_size // vision.config.patch_size)**2)
     return
 
 
 @app.cell
 def _(Example, device, heldout_examples, processor, train_examples, vision):
     def select_patch_features(states: torch.Tensor) -> torch.Tensor:
-        """Return the contextual patch vectors, excluding the classification token."""
-        raise NotImplementedError("Exercise 1: select patches without pooling or changing their order")
+        """Return the contextual patch vectors, preserving every SigLIP patch position."""
+        print(states.shape)
+        return states
 
     def patch_features(examples: list[Example]) -> torch.Tensor:
         pixels = processor(images=[example.image for example in examples], return_tensors="pt").pixel_values
@@ -639,11 +443,11 @@ def _(Example, device, heldout_examples, processor, train_examples, vision):
     print("Cached patches:", tuple(train_features.shape))
     print("Patch count:", (vision.config.image_size // vision.config.patch_size) ** 2)
 
-    # Check that two different images retain distinct features, all patch positions, and no CLS.
+    # Check that two different images retain distinct features, all patch positions, and patch order.
     probe = torch.arange(2 * 5 * 3, dtype=torch.float32).reshape(2, 5, 3)
     selected = select_patch_features(probe)
-    assert selected.shape == (2, 4, 3), "Keep batch and feature axes; remove exactly one sequence position."
-    torch.testing.assert_close(selected[:, 0], probe[:, 1])
+    assert selected.shape == probe.shape, "SigLIP has no CLS token; keep every patch."
+    torch.testing.assert_close(selected[:, 0], probe[:, 0])
     torch.testing.assert_close(selected[:, -1], probe[:, -1])
     assert not torch.equal(train_features[0], train_features[1]), "Different images lost their distinction."
     print("Exercise 1 checks passed.")
@@ -652,69 +456,17 @@ def _(Example, device, heldout_examples, processor, train_examples, vision):
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    ## Exercise 2: Translate visual features into LM embeddings
+    mo.md(r"""
+    ## 3. LM embedding alignment
 
-    **Explain first:** Explain to a beginner why equal vector widths do not mean two models understand the vectors
-    in the same way. What exactly must the projector learn?
+    Background: an LM reads vectors of its hidden width. Text IDs become vectors through its embedding table;
+    image features need a learned projection into that space. Matching widths makes the tensors compatible,
+    and caption training learns useful semantics.
 
-    **Predict before running:** Write the input, intermediate, and output shapes. Derive the trainable parameter
-    count including biases before printing it.
-
-    **Implement:** Complete `build_projector` with Linear → GELU → Linear. Both linear outputs have LM width. Keep
-    each patch independent.
-
-    **After the checks:** Explain why reversing patch order before the projector reverses its outputs. Would the
-    same statement hold for the full language model?
-    """
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(
-        r"""
-    ### Your explanation and predictions — edit this cell
-
-    **First explanation:** [Write 3-5 plain-language sentences.]
-
-    **Prediction:** [Write shapes or expected behavior, with your reasoning.]
-
-    **What actually happened:** [Fill this in after running the checks.]
-
-    **Gap I discovered:** [State what you misunderstood or what the checks did not establish.]
-
-    **Revised explanation:** [Teach the idea again in simpler words, using a concrete example.]
-    """
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(
-        r"""
-    <details>
-    <summary>Explanation hint — open after your first attempt</summary>
-
-    ## 5. Learn the connector
-
-    For each patch vector `v`, the projector computes `W₂ GELU(W₁v + b₁) + b₂`. Its output width equals the
-    language model's hidden width, making each output a continuous input embedding. There are no discrete image
-    token IDs and no vocabulary expansion in this prototype.
-
-    For pretrained Delphi, the shapes are `[B, 49, 768] → [B, 49, 1536]`. This two-layer MLP has approximately
-    3.54M parameters. Matching widths alone does not align semantics: training learns which embeddings help the
-    frozen LM predict the answer.
-
-    The projector stays FP32; its outputs are cast to the LM dtype at the boundary. Casting is differentiable. We
-    retain the initial state for controlled reruns and a save/reload check.
-
-    </details>
-    """
-    )
+    Code: complete `build_projector` with Linear → GELU → Linear. Both linear outputs have LM width.
+    Preserve batch and patch axes: `[B, 196, vision_width] → [B, 196, lm_width]`.
+    The projector stays FP32; casting its output to the LM dtype preserves gradients.
+    """)
     return
 
 
@@ -724,7 +476,12 @@ def _(cfg, device, lm, train_features, vision):
 
     def build_projector(vision_width: int, lm_width: int) -> nn.Module:
         """Map every patch independently through Linear, GELU, Linear to LM width."""
-        raise NotImplementedError("Exercise 2: build the two-layer projector")
+        print(vision_width, lm_width)
+        return nn.Sequential(
+            nn.Linear(vision_width, lm_width),
+            nn.GELU(),
+            nn.Linear(lm_width, lm_width)
+        )
 
     projector = build_projector(vision.config.hidden_size, lm.config.hidden_size).to(device)
     initial_projector = copy.deepcopy(projector.state_dict())
@@ -743,94 +500,34 @@ def _(cfg, device, lm, train_features, vision):
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    ## Exercise 3: Join images and text without leaking labels
+    mo.md(r"""
+    ### Exercise: assemble the sequence and targets
 
-    **Explain first:** Explain the difference between hiding a position from attention and excluding it from the
-    training loss. Why must the first answer token still be visible as an input during teacher forcing?
+    Background: teacher forcing supplies the correct previous caption tokens while predicting the next token.
+    Build `[BOS] [image embeddings] [prompt embeddings] [caption embeddings] [EOS]`, then right-pad.
+    `inputs_embeds` is `[B, S, D]`; attention masks and labels are `[B, S]`.
+    Here `B` is batch size, `S` is sequence length, and `D` is the LM hidden width.
 
-    **Predict before running:** Draw the sequence with positions numbered. Mark the image span, first answer
-    position, EOS, and padding. Predict which labels are -100.
+    The attention mask hides padding. The LM's causal mask hides future positions. Labels of `-100` exclude
+    BOS, images, prompt, and padding from loss; caption and EOS labels keep their vocabulary IDs.
+    EOS must remain supervised even if the tokenizer also uses EOS for padding.
 
-    **Implement:** Complete `prefix_embeddings` for one image at a time: its `features` input is `[1, patches,
-    vision_width]`. Complete `answer_targets` for a one-dimensional answer-ID tensor. Right-padding and batching
-    are supplied. Preserve BOS → patches → prompt order.
-
-    **After the checks:** Explain why using EOS as PAD does not require masking every EOS token. Describe the bug
-    that would create.
-    """
-    )
+    Code: complete `prefix_embeddings` and `answer_targets`. Concatenate along the sequence axis and keep
+    all caption/EOS targets. Batching and right-padding are supplied. Image patches consume LM context positions.
+    """)
     return
 
 
-@app.cell(hide_code=True)
-def _():
-    mo.md(
-        r"""
-    ### Your explanation and predictions — edit this cell
-
-    **First explanation:** [Write 3-5 plain-language sentences.]
-
-    **Prediction:** [Write shapes or expected behavior, with your reasoning.]
-
-    **What actually happened:** [Fill this in after running the checks.]
-
-    **Gap I discovered:** [State what you misunderstood or what the checks did not establish.]
-
-    **Revised explanation:** [Teach the idea again in simpler words, using a concrete example.]
-    """
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(
-        r"""
-    <details>
-    <summary>Explanation hint — open after your first attempt</summary>
-
-    ## 6. Assemble embeddings, labels, and padding
-
-    Each training sequence is:
-
-    ```text
-    [BOS] [image patch embeddings] [fixed prompt] [target tokens] [EOS] [PAD...]
-    ```
-
-    Targets are captions in pretrained mode and color answers in smoke mode.
-
-    `inputs_embeds` has shape `[B, S, D]`. `attention_mask` has shape `[B, S]`: 1 means a real position and 0 means
-    padding. The causal LM combines this with its internal lower-triangular mask, so a position cannot read future
-    answers. Vision patches have already interacted bidirectionally inside CLIP; their LM positions follow ordinary
-    causal attention.
-
-    `labels` has shape `[B, S]`. Prompt, image, BOS, and padding positions carry `-100`, PyTorch's ignored-loss
-    marker. Answer and EOS positions carry vocabulary IDs. Padding may share EOS's ID: `attention_mask=0` hides
-    padding from attention, while `labels=-100` excludes padding from cross entropy. Setting only the attention
-    mask does not suppress loss.
-
-    We tokenize the fixed prompt and the leading-space answer separately, defining an explicit token boundary. The
-    same prompt encoding is used at inference. No automatic BOS insertion occurs; we add BOS once ourselves.
-
-    One example is built at a time and then padded on the right. This makes variable answer lengths explicit and
-    avoids hiding the alignment inside a data collator.
-
-    The LM assigns sequence positions to the image embeddings just as it does to text embeddings. Qwen3 uses rotary
-    position embeddings (RoPE) inside attention, so image patches consume context positions. We keep the entire
-    sequence below the checkpoint's 4096-position training context; adding more image patches leaves fewer
-    positions for text.
-
-    </details>
-    """
-    )
+@app.cell
+def _(tokenizer):
+    tokenizer.vocab["PAD"], len(tokenizer.vocab)
     return
 
 
 @app.cell
 def _(
     PROMPT,
+    caption_ids,
     device,
     lm,
     projector,
@@ -848,9 +545,12 @@ def _(
     def prefix_embeddings(features: torch.Tensor, projector_model: nn.Module) -> torch.Tensor:
         embedding = lm.get_input_embeddings()
         bos = torch.tensor([[tokenizer.bos_token_id]], device=device)  # noqa: F841
+        bos_embedding = embedding(bos)
         prompt_ids = tokenizer(PROMPT, add_special_tokens=False, return_tensors="pt").input_ids.to(device)  # noqa: F841
         image_embeds = projector_model(features).to(embedding.weight.dtype)  # noqa: F841
-        raise NotImplementedError("Exercise 3a: concatenate BOS, projected patches, and prompt along sequence")
+        prompt_embeds = embedding(prompt_ids)
+        input_prefix = torch.cat([bos_embedding, image_embeds, prompt_embeds], axis=1)
+        return input_prefix
 
     def answer_targets(prefix_length: int, answer_ids: torch.Tensor) -> torch.Tensor:
         """Return ignored prefix targets followed by answer/EOS targets on the same device."""
@@ -860,7 +560,7 @@ def _(
         rows, targets, starts = ([], [], [])
         for feature, answer in zip(features, answers, strict=True):
             prefix = prefix_embeddings(feature.unsqueeze(0), projector_model)[0]
-            answer_ids = [*tokenizer(" " + answer, add_special_tokens=False).input_ids, tokenizer.eos_token_id]
+            answer_ids = caption_ids(answer)
             ids = torch.tensor(answer_ids, device=device)
             rows.append(torch.cat((prefix, lm.get_input_embeddings()(ids)), dim=0))
             targets.append(answer_targets(len(prefix), ids))
@@ -904,70 +604,18 @@ def _(
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    ## Exercise 4: Derive next-token supervision
+    mo.md(r"""
+    ## 4. Next-token prediction and loss
 
-    **Explain first:** Explain why a logit at position t is compared with a label at t+1. Use a three-word
-    sentence, without referring to an API.
+    Background: logits at position `t` predict the token at `t+1`. The final prompt position predicts the first
+    caption token, and the final caption position predicts EOS. Cross entropy is the mean negative log-probability
+    of the supervised targets. Labels of `-100` are ignored.
 
-    **Predict before running:** Identify which position predicts the first answer token and which predicts EOS.
-    Predict whether changing ignored-position logits will change the loss.
-
-    **Implement:** Complete `shifted_answer_loss` using cross entropy. Apply the one-token shift exactly once and
-    exclude -100 labels.
-
-    **After the checks:** Explain any mismatch with the library loss. Could an unshifted implementation produce a
-    plausible-looking training curve? Why?
-    """
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(
-        r"""
-    ### Your explanation and predictions — edit this cell
-
-    **First explanation:** [Write 3-5 plain-language sentences.]
-
-    **Prediction:** [Write shapes or expected behavior, with your reasoning.]
-
-    **What actually happened:** [Fill this in after running the checks.]
-
-    **Gap I discovered:** [State what you misunderstood or what the checks did not establish.]
-
-    **Revised explanation:** [Teach the idea again in simpler words, using a concrete example.]
-    """
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(
-        r"""
-    <details>
-    <summary>Explanation hint — open after your first attempt</summary>
-
-    ## 7. See the two masks and the one-token shift
-
-    At position `t`, the model predicts the token at `t+1`. Hugging Face shifts logits and labels internally when
-    given `labels`. The last prompt position predicts the first answer token; the last answer position predicts
-    EOS. Do not pre-shift labels yourself.
-
-    The training objective is the mean negative log-probability of the supervised answer/EOS tokens:
-
-    `loss = -mean(log p(target[t+1] | embeddings[:t+1]))`.
-
-    Teacher forcing supplies previous ground-truth answer tokens while predicting the next one. That is different
-    from generation, where the model feeds back its own predictions. The heatmap below shows valid causal attention
-    for the first example; the bars show which **logit positions** receive supervision after shifting.
-
-    </details>
-    """
-    )
+    Code: complete `shifted_answer_loss`: compare `logits[:, :-1]` with `labels[:, 1:]` using cross entropy.
+    Flatten batch and sequence axes, preserve the vocabulary axis, and compute in FP32.
+    Hugging Face shifts internally when given unshifted labels; compare your loss with that result.
+    The plot shows causal attention and the prediction positions that contribute to loss.
+    """)
     return
 
 
@@ -1011,69 +659,16 @@ def _(batch, device, lm):
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    ## Exercise 5: Send learning signals through frozen weights
+    mo.md(r"""
+    ## 5. Training
 
-    **Explain first:** Explain how changing an input can change a function output even when its weights are fixed.
-    Apply that reasoning to projector → frozen LM → loss.
+    Background: freezing weights prevents parameter updates while still allowing derivatives with respect
+    to their inputs. The loss must flow through Delphi into the projector. `eval()` controls behaviors such
+    as dropout; it does not disable gradients. `no_grad()` around the LM training forward would break learning.
 
-    **Predict before running:** Predict which parameters should have gradients. Predict what wrapping the LM
-    training forward pass in no_grad would do.
-
-    **Implement:** Replace the unfinished line with one backward call on `_gradient_output.loss`. The provided code
-    rebuilds the forward graph on each cell run, so rerunning this exercise does not reuse a consumed graph. Leave
-    the model weights frozen.
-
-    **After the checks:** Explain the difference among eval(), requires_grad_(False), and no_grad(). Why does the
-    frozen LM still consume activation memory?
-    """
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(
-        r"""
-    ### Your explanation and predictions — edit this cell
-
-    **First explanation:** [Write 3-5 plain-language sentences.]
-
-    **Prediction:** [Write shapes or expected behavior, with your reasoning.]
-
-    **What actually happened:** [Fill this in after running the checks.]
-
-    **Gap I discovered:** [State what you misunderstood or what the checks did not establish.]
-
-    **Revised explanation:** [Teach the idea again in simpler words, using a concrete example.]
-    """
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(
-        r"""
-    <details>
-    <summary>Explanation hint — open after your first attempt</summary>
-
-    ## 8. Frozen weights still transmit gradients
-
-    `requires_grad_(False)` prevents parameter-gradient storage and updates for the LM. It does **not** disable
-    differentiation with respect to the LM inputs. We need `∂loss/∂image_embeddings` to update the projector.
-
-    Wrapping the LM training forward pass in `no_grad()` would break this path. Calling `eval()` is different: it
-    changes behaviors such as dropout, while leaving autograd enabled. The frozen LM still needs activation memory
-    for backpropagation; freezing 998M parameters does not make training free.
-
-    The checks below verify that the loss reaches the projector and that neither pretrained component accumulates
-    parameter gradients.
-
-    </details>
-    """
-    )
+    Code: complete the backward call below. Check that the projector receives nonzero gradients and both
+    backbones retain no parameter gradients.
+    """)
     return
 
 
@@ -1109,25 +704,17 @@ def _(
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    ## 9. Evaluate before training, then try to overfit
+    mo.md(r"""
+    ### Exercise: update the projector
 
-    We use AdamW with no weight decay and clip the projector gradient norm at 1.0. Each step trains on one of the
-    retained examples to limit activation memory. Cycling gives equal exposure when the update count is divisible
-    by the training-example count; otherwise exposure differs by at most one update. Forty steps is a starting
-    budget, not a promised convergence threshold.
+    Background: AdamW uses gradients to update parameters. Each step uses one caption to limit activation memory.
+    Training starts from the same initial projector on each click. Falling training loss may reflect memorization;
+    held-out loss and mismatched-image loss help check whether the image affects prediction.
 
-    Evaluation averages each example's answer/EOS loss. We compare correct images to a cyclic shift of the images:
-    images are reassigned to different targets. A reassigned natural image may still partially fit its caption. If
-    the correct-image loss becomes lower, that is evidence the predictions depend on the image. A reduced training
-    loss alone cannot establish this.
-
-    Each training-button click creates a separate `trained_projector` from the initial weights and a fresh
-    optimizer to make the comparison reproducible. We log held-out loss before and after training; the plot
-    contains individual training-example losses, which can oscillate across examples.
-    """
-    )
+    Code: complete `projector_step` with backward propagation, gradient clipping at norm 1.0, and an optimizer
+    step. The surrounding loop, evaluation, and loss plot are supplied. Compare before/after losses for correct
+    and cyclically reassigned images. Forty updates are only a starting budget.
+    """)
     return
 
 
@@ -1171,6 +758,10 @@ def _(
             losses.append(result.loss.item())
         return sum(losses) / len(losses)
 
+    def projector_step(loss: torch.Tensor, model: nn.Module, optimizer: torch.optim.Optimizer) -> torch.Tensor:
+        """Backpropagate, clip gradients, update weights, and return the pre-clipping norm."""
+        raise NotImplementedError("Training: backward, clip gradients at 1.0, optimizer.step, return norm")
+
     trained_projector = copy.deepcopy(projector)
     trained_projector.load_state_dict(initial_projector)
     optimizer = torch.optim.AdamW(trained_projector.parameters(), lr=cfg.learning_rate, weight_decay=0.0)
@@ -1190,9 +781,7 @@ def _(
             labels=training.labels,
             use_cache=False,
         )
-        result.loss.backward()
-        norm = nn.utils.clip_grad_norm_(trained_projector.parameters(), max_norm=1.0, error_if_nonfinite=True)
-        optimizer.step()
+        norm = projector_step(result.loss, trained_projector, optimizer)
         history.append(result.loss.item())
         if step == 0 or (step + 1) % 10 == 0:
             print(f"step={step + 1} loss={history[-1]:.4f} gradient_norm={norm.item():.4f}")
@@ -1214,72 +803,19 @@ def _(
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    ## Exercise 6: Generate an answer without teacher forcing
+    mo.md(r"""
+    ## 6. Further experiments
 
-    **Explain first:** Explain how generation differs from training. What supplies the second answer token's
-    context at inference?
+    ### Exercise: generate a caption
 
-    **Predict before running:** Predict how the embedding sequence length changes per iteration. Explain which
-    logit row you need and what happens at EOS.
+    Background: generation begins with the image and prompt, then feeds back each predicted token.
+    Greedy decoding chooses the largest final-position logit. Stop at EOS or the token budget.
+    Unlike teacher forcing, generation never receives the reference caption.
 
-    **Implement:** Complete `generate_answer`. Use the explicit `max_new_tokens` budget in a bounded greedy loop,
-    append predicted-token embeddings, and return only the generated text. All evaluation/reporting code is
-    supplied.
-
-    **After the checks:** Explain why low teacher-forced loss can coexist with poor free-running answers. Identify
-    the work repeated by this cache-free decoder.
-    """
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(
-        r"""
-    ### Your explanation and predictions — edit this cell
-
-    **First explanation:** [Write 3-5 plain-language sentences.]
-
-    **Prediction:** [Write shapes or expected behavior, with your reasoning.]
-
-    **What actually happened:** [Fill this in after running the checks.]
-
-    **Gap I discovered:** [State what you misunderstood or what the checks did not establish.]
-
-    **Revised explanation:** [Teach the idea again in simpler words, using a concrete example.]
-    """
-    )
-    return
-
-
-@app.cell(hide_code=True)
-def _():
-    mo.md(
-        r"""
-    <details>
-    <summary>Explanation hint — open after your first attempt</summary>
-
-    ## 10. Generate without showing the answer
-
-    Generation starts with BOS, image embeddings, and the prompt only. Each iteration takes the most likely next
-    token, appends its embedding, and reruns the LM. EOS stops decoding. This explicit greedy loop makes the
-    train/inference boundary visible.
-
-    We disable the KV cache here to keep the code short; production decoding should cache prior attention keys and
-    values (the KV cache). Greedy decoding is deterministic for a fixed model/device, but bitwise reproducibility
-    across hardware is not guaranteed. Base models may emit extra text, and a random smoke model's strings have no
-    semantic significance.
-
-    In smoke mode we report strict color exact-match, so “red square” does not match “red”. With four examples the
-    score moves in 25-point increments. In LLaVA mode, inspect generated captions alongside targets and compare
-    caption loss for correct versus wrong images; valid captions need not match the target word for word.
-
-    </details>
-    """
-    )
+    Code: complete `generate_answer`. Run the LM with `inputs_embeds` and `use_cache=False`, choose the next ID,
+    append its embedding, and repeat. Decode only generated IDs, excluding EOS. Compare captions from correct
+    and reassigned images; the supplied checks verify mechanics, not caption quality.
+    """)
     return
 
 
@@ -1292,7 +828,6 @@ def _():
 
 @app.cell
 def _(
-    RunMode,
     cfg,
     generate_button,
     heldout_examples,
@@ -1321,17 +856,7 @@ def _(
         wrong_prediction = generate_answer(wrong, cfg.max_new_tokens)
         predictions.append(prediction)
         print(f"target={_example.answer!r} correct_image={prediction!r} wrong_image={wrong_prediction!r}")
-    accuracy = None
-    if cfg.mode == RunMode.SMOKE:
-        accuracy = sum(
-            (
-                prediction.lower() == example.answer
-                for prediction, example in zip(predictions, heldout_examples, strict=True)
-            )
-        ) / len(heldout_examples)
-        print("Held-out rendering exact match:", accuracy)
-    else:
-        print("Caption evaluation: use the correct/wrong-image losses above and inspect generations.")
+    print("Compare the correct/wrong-image losses and inspect generated captions.")
     assert generate_answer(heldout_features[0], 0) == "", "Respect the output token budget."
     with torch.no_grad():
         for feature in heldout_features:
@@ -1349,28 +874,21 @@ def _(
         "Exercise 6 budget, first-token, and determinism checks passed. "
         "These do not establish answer quality or exhaustively test later EOS handling."
     )
-    return (accuracy,)
+    return prediction, predictions
 
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    ## 11. Save what actually learned
+    mo.md(r"""
+    ### Save your projector
 
-    Only the projector changed. Its weights are usable only with the same backbone, encoder, feature selection,
-    preprocessing, prompt, and sequence layout. We save those references alongside configuration and measured
-    losses. In pretrained mode, these projector weights plus the pinned backbones and notebook architecture are
-    enough to reconstruct inference. In smoke mode, reconstruction also requires replaying the seeded random
-    backbone initialization; those random backbone weights are not saved. Resuming training exactly would also
-    require optimizer and random-number-generator (RNG) state.
+    Only the projector learned. Save its weights together with the pinned checkpoints, processor, prompt,
+    sequence layout, data split, and measured losses. Those references are required to reconstruct inference.
+    Exact training resumption also requires optimizer and RNG state.
 
-    Click the save button to write the trained projector. The output goes to a temporary directory, outside the
-    repository. After saving the weights, use **Download projector** to export them. Clicking save again replaces this
-    notebook's local output file. The reload check compares projected embeddings before and after a real
-    serialization round trip.
-    """
-    )
+    The button writes to a temporary directory and checks a save/reload round trip. Download the file before
+    ending a remote session.
+    """)
     return
 
 
@@ -1384,8 +902,6 @@ def _():
 @app.cell
 def _(
     PROMPT,
-    RunMode,
-    accuracy,
     after,
     before,
     cfg,
@@ -1393,38 +909,35 @@ def _(
     heldout_examples,
     heldout_features,
     lm_dtype,
+    predictions,
     processor,
     save_button,
     train_examples,
     trained_projector,
 ):
     mo.stop(not save_button.value, mo.md("Click **Save projector** to write the trained weights."))
-    artifact_dir = Path(tempfile.gettempdir()) / "marin-vlm-exploration" / cfg.mode.value
+    artifact_dir = Path(tempfile.gettempdir()) / "marin-vlm-exploration"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     artifact_path = artifact_dir / "projector.pt"
     metadata = {
         "config": dataclasses.asdict(cfg),
         "prompt": PROMPT,
         "layout": "BOS,image_patches,prompt,answer,EOS",
-        "vision_features": "last_hidden_state[:,1:,:]",
+        "vision_features": "last_hidden_state",
         "processor": processor.to_dict(),
         "packages": {name: version(name) for name in ("torch", "transformers", "pillow", "pyarrow", "huggingface-hub")},
         "python": platform.python_version(),
         "lm_dtype": str(lm_dtype),
-        "data_source": "synthetic" if cfg.mode == RunMode.SMOKE else cfg.dataset_id,
+        "data_source": cfg.dataset_id,
         "train_image_ids": [example.source_id for example in train_examples],
         "heldout_image_ids": [example.source_id for example in heldout_examples],
-        "split_rule": (
-            "synthetic rendering shift"
-            if cfg.mode == RunMode.SMOKE
-            else "sha256(encoded_image) first 8 hex digits modulo 5; heldout=0"
-        ),
+        "split_rule": "sha256(encoded_image) first 8 hex digits modulo 5; heldout=0",
         "before": before,
         "after": after,
-        "heldout_exact_match": accuracy,
+        "generated_captions": predictions,
         "issue": "https://github.com/marin-community/marin/issues/9524",
     }
-    # Convert StrEnum and any processor metadata into JSON-safe primitives.
+    # Convert processor metadata into JSON-safe primitives.
     metadata = json.loads(json.dumps(metadata))
     torch.save(
         {
@@ -1442,118 +955,58 @@ def _(
     mo.output.append(
         mo.download(
             data=artifact_path.read_bytes,
-            filename=f"marin-vlm-{cfg.mode.value}-projector.pt",
+            filename="delphi-siglip-projector.pt",
             mimetype="application/octet-stream",
             label="Download projector",
         )
     )
-    print(
-        json.dumps({"mode": cfg.mode.value, "before": before, "after": after, "heldout_exact_match": accuracy}, indent=2)
-    )
+    print(json.dumps({"before": before, "after": after, "generated_captions": predictions}, indent=2))
     return
 
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    ## Exercise 7: challenge your explanation with an experiment
+    mo.md(r"""
+    ### Exercise: compare one variant
 
-    **Explain:** If the training loss falls, have we shown the model uses images? Explain why or why not to someone
-    who has never seen a loss curve.
+    Background: a controlled comparison changes one factor while keeping checkpoints, examples, seed, and
+    update budget fixed. A lower training loss alone cannot show improved image use.
 
-    **Predict:** Choose one change: replace the MLP with a linear projector, or average patch vectors into one
-    image token. Write a directional prediction for loss, token/parameter count, and image dependence. Give a
-    reason that could be wrong.
+    Code: choose a linear projector or average patches into one image vector. For pooling, transform both
+    `train_features` and `heldout_features` after extraction using the patch axis and `keepdim=True`.
+    Reinitialize the projector and optimizer, rerun dependent cells, and train again.
 
-    **Implement and compare:** Save the first run's measurements below, then make your change. For pooling,
-    edit the existing feature-extraction cell after its Exercise 1 checks: average `train_features` and
-    `heldout_features` along the patch axis with `keepdim=True`, assigning back to those names in that same cell.
-    Keep `select_patch_features` unchanged; its job remains to preserve all patches. Each rerun extracts fresh
-    features before pooling them. Run the stale dependent cells and click the training/generation buttons again.
-    Reinitialize the projector and optimizer; hold backbone, examples, seed, and update budget fixed. Keep both
-    correct-image and wrong-image evaluations. Do not compare smoke results against pretrained results.
+    | Run | Change | Image tokens | Parameters | Train loss | Held-out loss | Wrong-image loss |
+    |---|---|---|---|---|---|---|
+    | Baseline | MLP, all patches | | | | | |
+    | Variant | | | | | | |
 
-    | Run | Mode | Change | Image tokens | Parameters | Train loss | Held-out loss | Wrong-image loss | Exact match |
-    |---|---|---|---|---|---|---|---|---|
-    | Baseline | | | | | | | | |
-    | Your variant | | | | | | | | |
-
-    **Your prediction and reasoning:** [Write before running the variant.]
-
-    **Your implementation change:** [Name the function and describe what you changed.]
-
-    **Evidence for or against your explanation:** [Use the measurements, including negative results. Use exact
-    match only for the synthetic color task; mark it N/A for captions.]
-
-    **Revised explanation:** [Explain what your experiment taught you, without jargon.]
-
-    **What this cannot establish:** [Discuss the bounded caption sample or four-color dataset and the frozen/random
-    versus pretrained backbone.]
-
-    **Transfer question:** What would need to change to scale caption alignment and then train on natural-image
-    questions, and what would stay the same? Name the data split, trainable components, and loss-mask decisions.
-
-    Do not mark the exercise complete merely because code ran. You should be able to reconstruct the
-    image-to-answer path from a blank page and explain each gradient and mask.
-    """
-    )
+    Write a prediction before running, then explain whether the measured result supports it.
+    """)
     return
 
 
 @app.cell(hide_code=True)
 def _():
-    mo.md(
-        r"""
-    ## 12. Change one thing at a time
+    mo.md(r"""
+    ## Change one thing at a time
 
-    1. **Linear versus MLP projector:** replace the `nn.Sequential` with one `nn.Linear(vision_width, lm_width)`.
-    Rerun the projector cell and click the training and generation buttons again. Keep checkpoint revisions,
-    examples, seed, and update budget fixed; compare correct/wrong-image loss, trainable parameter counts, and (for
-    smoke mode only) exact match. This toy task cannot decide which connector is better for natural-image VQA.
-    2. **Image-token count:** averaging all patches into one vector shortens the LM sequence, but loses the
-    separate spatial positions. Apply the same transformation to training and held-out features. Compare quality
-    and memory at a fixed training budget.
-    3. **Natural images:** the pretrained path now uses a bounded LLaVA 558K sample. For a larger experiment,
-    replace this first-row sample with a representative split by source image and train on fresh streamed batches.
-    A suggested workflow is caption alignment (train the connector to predict image captions with both backbones
-    frozen), followed by image-question-answer instruction tuning. Pretrained mode demonstrates caption alignment
-    on a small sample; smoke mode demonstrates a synthetic color question. Full visual instruction tuning remains a
-    later stage. Mask prompt/image positions exactly as above.
-    4. **Adapt the LM:** after alignment, consider low-rank adaptation (LoRA), which learns small additional weight
-    matrices, or selected unfrozen layers. Add those trainable parameters to the optimizer and budget for their
-    gradients/state. The current optimizer updates only the projector. Freezing the LM here was a choice for
-    learning and low-cost exploration, not a requirement of VLM training.
-    5. **Marin 8B:** choose an immutable revision of `marin-community/marin-8b-base`, load its tokenizer/config,
-    and recreate the projector. Its hidden width is 4096, so this Delphi projector cannot be reused unchanged.
-    Budget for substantially more weight and activation memory.
+    1. **Projector:** compare one linear layer with the two-layer MLP. Keep Delphi and SigLIP fixed.
+    2. **Image-token count:** average patches into one vector. Apply the same transformation to both splits;
+       compare loss and memory at the same update budget.
+    3. **Data size:** increase the bounded caption sample, then use a representative split by source image.
+       Keep the caption objective fixed before trying image-question-answer data.
+    4. **Learning rate or updates:** change one of these and compare the loss curves from the same initial weights.
+    5. **Trainable components:** after alignment, try LoRA (small learned weight additions) or selected Delphi layers.
+       Include their parameters in the optimizer and budget for additional memory.
 
-    Record the exact mode, revisions, seed, data split, update count, before/after losses, generated answers, and
-    limitations in [#9524](https://github.com/marin-community/marin/issues/9524). This notebook does not post to
-    GitHub automatically.
+    Record revisions, split, seed, update count, before/after losses, generated captions, and limitations.
+    This small caption study does not establish general visual question answering.
 
-    ### How this connects to Marin
-
-    - [Model download handles](../models.py) identify pretrained checkpoints separately from architecture presets.
-    - [Levanter Llama implementation](../../lib/levanter/src/levanter/models/llama.py) separates embeddings,
-    transformer, and language-model head. Those are the same boundaries used here.
-    - [Grug](../grug/README.md) is a template-based model/train/launch workflow with its own variants. This
-    notebook does not load Delphi weights into Grug.
-    - A native training experiment will also need multimodal data loading, checkpoint export, distributed
-    placement, and evaluation wiring. The notebook establishes the tensor and loss contracts before that
-    integration.
-
-    ### Sources
-
-    - [Delphi 998M model card](https://huggingface.co/marin-community/delphi-3e20-998Mparams-49.8Btokens)
-    - [CLIP model and preprocessing API](https://huggingface.co/docs/transformers/model_doc/clip)
-    - [Qwen3 model API](https://huggingface.co/docs/transformers/model_doc/qwen3)
-    - [LLaVA architecture](https://huggingface.co/docs/transformers/model_doc/llava)
-
-    No pretrained capability results are included in the saved notebook. Run the cells on your chosen hardware to
-    produce them.
-    """
-    )
+    [Delphi checkpoint](https://huggingface.co/marin-community/delphi-3e20-998Mparams-49.8Btokens) ·
+    [SigLIP checkpoint](https://huggingface.co/google/siglip-base-patch16-224) ·
+    [SigLIP API](https://huggingface.co/docs/transformers/model_doc/siglip)
+    """)
     return
 
 

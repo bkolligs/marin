@@ -254,3 +254,4 @@ lib/iris/src/iris/_build_info.py
 
 # direnv
 .envrc
+__marimo__
