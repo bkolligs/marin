@@ -514,6 +514,24 @@ def _():
 
     Code: complete `prefix_embeddings` and `answer_targets`. Concatenate along the sequence axis and keep
     all caption/EOS targets. Batching and right-padding are supplied. Image patches consume LM context positions.
+
+    `answer_targets(prefix_length, answer_ids)` returns a **1D integer tensor** of shape
+    `[prefix_length + len(answer_ids)]`, with the same dtype and device as `answer_ids`.
+    `prefix_length` counts every BOS, image, and prompt position. `answer_ids` already includes EOS,
+    added by `caption_ids`; preserve these IDs exactly and do not append another EOS.
+
+    For example, with `prefix_length = 4` and illustrative `answer_ids = [42, 17, 2]`
+    (where `2` is EOS), the expected output is:
+
+    ```text
+    Input positions: BOS   image   image   prompt   caption   caption   EOS
+    Target labels:  -100   -100    -100    -100     42        17        2
+    ```
+
+    These labels stay aligned with their input positions. Do not shift them here: the next exercise
+    compares `logits[:, :-1]` with `labels[:, 1:]`, so the last prompt position predicts the first
+    caption token. `training_batch` adds any right-padding labels as `-100` afterward.
+    Return vocabulary IDs, not embeddings, decoded text, probabilities, or a mask of ones.
     """)
     return
 
@@ -554,7 +572,10 @@ def _(
 
     def answer_targets(prefix_length: int, answer_ids: torch.Tensor) -> torch.Tensor:
         """Return ignored prefix targets followed by answer/EOS targets on the same device."""
-        raise NotImplementedError("Exercise 3b: mask the prefix while preserving every answer and EOS ID")
+        targets = torch.ones(prefix_length + len(answer_ids)) * -100
+        targets[-len(answer_ids):] = answer_ids
+        return targets.long()
+    
 
     def training_batch(features: torch.Tensor, answers: list[str], projector_model: nn.Module) -> Batch:
         rows, targets, starts = ([], [], [])
@@ -640,7 +661,9 @@ def _(batch, device, lm):
 
     def shifted_answer_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """Compute next-token cross entropy over answer/EOS targets, ignoring -100."""
-        raise NotImplementedError("Exercise 4: align predictions with next-token targets and compute loss")
+        print(labels)
+        loss = F.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]), labels[:, 1:].reshape(-1), ignore_index=-100)
+        return loss
 
     manual_loss = shifted_answer_loss(output.logits, batch.labels)
     print("model loss / manually shifted loss:", output.loss.item(), manual_loss.item())
@@ -691,7 +714,9 @@ def _(
         labels=_gradient_batch.labels,
         use_cache=False,
     )
-    raise NotImplementedError("Exercise 5: propagate the scalar loss backward without unfreezing the LM")
+
+    _gradient_output.loss.backward()
+
     _gradient_norm = torch.linalg.vector_norm(torch.stack([p.grad.norm() for p in projector.parameters()]))
     print("Projector gradient norm:", _gradient_norm.item())
     assert torch.isfinite(_gradient_norm) and _gradient_norm > 0
@@ -760,7 +785,11 @@ def _(
 
     def projector_step(loss: torch.Tensor, model: nn.Module, optimizer: torch.optim.Optimizer) -> torch.Tensor:
         """Backpropagate, clip gradients, update weights, and return the pre-clipping norm."""
-        raise NotImplementedError("Training: backward, clip gradients at 1.0, optimizer.step, return norm")
+        loss.backward()
+        pre_clipped_norm = torch.linalg.vector_norm(torch.stack([p.grad.norm() for p in model.parameters()]))
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0, norm_type=2.0)
+        optimizer.step()
+        return pre_clipped_norm
 
     trained_projector = copy.deepcopy(projector)
     trained_projector.load_state_dict(initial_projector)
@@ -844,18 +873,32 @@ def _(
         """Greedily decode from image + prompt only; stop at EOS or the token budget."""
         embedded = prefix_embeddings(feature.unsqueeze(0), trained_projector)  # noqa: F841
         generated = []  # noqa: F841
-        raise NotImplementedError(
-            "Exercise 6: implement the greedy next-token loop"
-        )  # Keep the LM cache disabled. Decode only generated IDs, excluding EOS.
+        t_i = 0
+        while t_i < max_new_tokens:
+            token = lm(inputs_embeds=embedded, use_cache=False).logits[0, -1].argmax()
+            generated.append(token)
+            if token == tokenizer.eos_token_id:
+                break
+
+        
+            embeddings = lm.get_input_embeddings()
+            next_embedding = embeddings(token)[None, None, :]
+            embedded = torch.cat((embedded, next_embedding), axis=1)
+            t_i += 1
+    
+            answer = tokenizer.decode(generated)
+            print(f"{t_i}: {answer})")
+
+        return tokenizer.decode(generated)
 
     predictions = []
     for _example, correct, wrong in zip(
         heldout_examples, heldout_features, heldout_features.roll(1, dims=0), strict=True
     ):
-        prediction = generate_answer(correct, cfg.max_new_tokens)
+        prediction_i = generate_answer(correct, cfg.max_new_tokens)
         wrong_prediction = generate_answer(wrong, cfg.max_new_tokens)
-        predictions.append(prediction)
-        print(f"target={_example.answer!r} correct_image={prediction!r} wrong_image={wrong_prediction!r}")
+        predictions.append(prediction_i)
+        print(f"target={_example.answer!r} correct_image={prediction_i!r} wrong_image={wrong_prediction!r}")
     print("Compare the correct/wrong-image losses and inspect generated captions.")
     assert generate_answer(heldout_features[0], 0) == "", "Respect the output token budget."
     with torch.no_grad():
@@ -874,7 +917,7 @@ def _(
         "Exercise 6 budget, first-token, and determinism checks passed. "
         "These do not establish answer quality or exhaustively test later EOS handling."
     )
-    return prediction, predictions
+    return (predictions,)
 
 
 @app.cell(hide_code=True)
