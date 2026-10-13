@@ -51,14 +51,12 @@ STREAMING_MAX_BUFFERED_BATCHES = 4  # Memory-efficient buffering for streaming m
 STREAMING_PREFETCH_SIZE = 2  # Minimal prefetch to avoid OOM in streaming mode
 
 
-def _load_vision_weights(model, checkpoint_path, axis_mapping, mp):
+def _load_vision_weights(model, checkpoint_path):
     """Load vision encoder weights from a separate HuggingFace checkpoint.
 
     Args:
         model: The LlavaOnevisionModel to load weights into
         checkpoint_path: HuggingFace checkpoint path (e.g., 'google/siglip-so400m-patch14-384')
-        axis_mapping: Axis mapping for sharding
-        mp: Mixed precision policy
 
     Returns:
         Model with vision weights loaded
@@ -89,15 +87,12 @@ def _load_vision_weights(model, checkpoint_path, axis_mapping, mp):
     return model
 
 
-def _load_llm_weights(model, checkpoint_path, axis_mapping, mp, Vocab):
+def _load_llm_weights(model, checkpoint_path):
     """Load language model weights from a separate HuggingFace checkpoint.
 
     Args:
         model: The LlavaOnevisionModel to load weights into
         checkpoint_path: HuggingFace checkpoint path (e.g., 'Qwen/Qwen3-1.7B')
-        axis_mapping: Axis mapping for sharding
-        mp: Mixed precision policy
-        Vocab: Vocabulary axis
 
     Returns:
         Model with LLM weights loaded
@@ -543,11 +538,11 @@ def main(config: TrainVLMConfig):
 
                 if config.vision_checkpoint:
                     logger.info(f"Loading vision encoder from: {config.vision_checkpoint}")
-                    model = _load_vision_weights(model, config.vision_checkpoint, parameter_axis_mapping, trainer.mp)
+                    model = _load_vision_weights(model, config.vision_checkpoint)
 
                 if config.llm_checkpoint:
                     logger.info(f"Loading LLM from: {config.llm_checkpoint}")
-                    model = _load_llm_weights(model, config.llm_checkpoint, parameter_axis_mapping, trainer.mp, Vocab)
+                    model = _load_llm_weights(model, config.llm_checkpoint)
 
                 model = named_jit(trainer.mp.cast_to_param, parameter_axis_mapping)(model)
                 state = dataclasses.replace(state, model=model)
@@ -613,7 +608,6 @@ def main(config: TrainVLMConfig):
             fetch_batch_size=STREAMING_PREFETCH_SIZE,
         ).iter_from_step(state.step)
 
-        # Run training
         trainer.train(state, train_loader)
 
 

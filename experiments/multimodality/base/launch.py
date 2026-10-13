@@ -29,6 +29,7 @@ from levanter.distributed import DistributedConfig
 from levanter.optim.config import AdamConfig
 from levanter.tracker.tracker import NoopConfig
 from levanter.tracker.wandb import WandbConfig
+from rigging.filesystem.storage_path import prefix_join
 
 import experiments.multimodality.base.train as train_vlm
 from experiments.multimodality.base.vlm_model import VlmConfig
@@ -184,12 +185,6 @@ def parse_args():
         "Useful for vision encoder fine-tuning or projector-only training.",
     )
     parser.add_argument(
-        "--fsdp_axis",
-        type=str,
-        default="embed",
-        help="Axis to use for FSDP sharding. Options: embed, mlp, or comma-separated list",
-    )
-    parser.add_argument(
         "--no_gradient_checkpointing",
         action="store_true",
         help="Disable gradient checkpointing (enabled by default to reduce memory usage)",
@@ -304,18 +299,16 @@ def main():
     logger.info(f"  Flash attention: {not args.no_flash_attention}")
     logger.info(f"  Freeze vision encoder: {args.freeze_vision_encoder}")
     logger.info(f"  Per-device parallelism: {args.per_device_parallelism}")
-    logger.info(f"  FSDP axis: {args.fsdp_axis}")
     logger.info(f"  Gradient checkpointing: {not args.no_gradient_checkpointing}")
     logger.info("-" * 60)
 
-    # Create data config
     data_config = ImageMixtureDatasetConfig(
         cache_dir=args.cache_dir,
         configs={
             "train": ConversationDatasetSourceConfig(
                 train_urls=[f"file://{args.train_data}"],
                 validation_urls=[f"file://{args.val_data}"],
-                cache_dir=f"{args.cache_dir}/train",
+                cache_dir=prefix_join(args.cache_dir, "train"),
             ),
         },
         train_weights={"train": 1.0},
@@ -356,12 +349,9 @@ def main():
         # Calculate total dataset size from all training datasets
         total_dataset_size = 0
         for name, ds in train_datasets.items():
-            try:
-                ds_len = asyncio.run(ds.async_len())
-                total_dataset_size += ds_len
-                logger.info(f"  Dataset '{name}': {ds_len:,} samples")
-            except Exception as e:
-                logger.warning(f"Could not get length of dataset '{name}': {e}")
+            ds_len = asyncio.run(ds.async_len())
+            total_dataset_size += ds_len
+            logger.info(f"  Dataset '{name}': {ds_len:,} samples")
 
         if total_dataset_size > 0:
             # Calculate steps needed for the specified number of epochs
@@ -399,13 +389,8 @@ def main():
     distributed_config = DistributedConfig(initialize_jax_distributed=not args.no_distributed)
 
     # Set checkpoint path
-    checkpointer_path = args.checkpointer_path or f"{args.output_dir}/checkpoints"
+    checkpointer_path = args.checkpointer_path or prefix_join(args.output_dir, "checkpoints")
     checkpointer_config = CheckpointerConfig(base_path=checkpointer_path)
-
-    # Parse FSDP axis (can be comma-separated for multi-axis)
-    fsdp_axis = args.fsdp_axis
-    if "," in fsdp_axis:
-        fsdp_axis = [ax.strip() for ax in fsdp_axis.split(",")]
 
     # Convert mixed precision string to jmp.Policy
     # jmp.get_policy accepts strings like "f32", "bf16", "bfloat16", or
@@ -426,8 +411,6 @@ def main():
         tracker=tracker_config,
         checkpointer=checkpointer_config,
         distributed=distributed_config,
-        # # FSDP configuration
-        # fsdp_axis=fsdp_axis,
         # Mixed precision configuration
         mp=mp_policy,
     )
@@ -439,7 +422,7 @@ def main():
         trainer=trainer_config,
         optimizer=optimizer_config,
         # Disable HF loading when using custom config - we'll load weights separately
-        initialize_from_hf=args.model_name if args.initialize_from_hf else False,
+        initialize_from_hf=args.model_name if args.initialize_from_hf else None,
         use_hf_model_config=args.use_hf_model_config and not args.use_small_model,
         hf_save_path=args.hf_save_path,
         hf_save_steps=args.hf_save_steps,
