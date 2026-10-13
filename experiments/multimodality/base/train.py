@@ -182,7 +182,7 @@ def _get_first_example(dataset):
         if hasattr(dataset, "cache"):
             return dataset.cache.get_batch_sync([0])[0]
 
-        # StreamingImageDataset or other AsyncDataset - use get_batch
+        # OnDemandImageDataset or other AsyncDataset - use get_batch
         if hasattr(dataset, "get_batch"):
             # Run async get_batch synchronously
             loop = asyncio.new_event_loop()

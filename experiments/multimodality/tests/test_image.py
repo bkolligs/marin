@@ -20,17 +20,18 @@ from levanter.data.image import (
     ImageMixtureDatasetConfig,
     ImageTextDataset,
     ImageTextExample,
-    StreamingImageDataset,
-    create_custom_processor,
+    OnDemandImageDataset,
     load_image,
 )
 from levanter.data.loader import DataLoader
+from levanter.data.onevision import create_custom_processor
 from levanter.layers.attention import AttentionBackend
 from levanter.models.llava_onevision import LlavaOnevisionConfig, LlavaOnevisionModel
 from levanter.store.cache import SerialCacheWriter
-from levanter.testing.vlm import DEFAULT_GRID_PINPOINTS, get_real_data
 from levanter.trainer import TrainerConfig
 from transformers import AutoProcessor
+
+from lib.levanter.tests.vlm_fixtures import DEFAULT_GRID_PINPOINTS, get_real_data
 
 # These integration tests download models and image datasets.
 pytestmark = pytest.mark.slow
@@ -441,7 +442,7 @@ def test_cache_vs_streaming_data_consistency():
 
 
 def test_streaming_dataset_basic():
-    """Test StreamingImageDataset functionality."""
+    """Test OnDemandImageDataset functionality."""
 
     model_name = "llava-hf/llava-onevision-qwen2-0.5b-si-hf"
 
@@ -467,7 +468,7 @@ def test_streaming_dataset_basic():
 
         datasets = config.training_sets()
         dataset = next(iter(datasets.values()))
-        assert isinstance(dataset, StreamingImageDataset)
+        assert isinstance(dataset, OnDemandImageDataset)
 
         async def run_tests():
             length = await dataset.async_len()

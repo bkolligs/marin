@@ -17,23 +17,23 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from levanter.data.image import BatchImageProcessor, CustomVLMProcessor
+from levanter.data.image import BatchImageProcessor
 from levanter.data.image import ImageTextExample as ImgTextEx
 from levanter.layers.attention import AttentionBackend
 from levanter.models.llava_onevision import LlavaOnevisionConfig, LlavaOnevisionModel
 from levanter.testing.helpers import skip_if_no_torch
-from levanter.testing.vlm import (
+from levanter.trainer import TrainerConfig
+from PIL import Image
+from transformers import AutoConfig
+
+from experiments.multimodality.base.train import compute_vlm_loss
+from lib.levanter.tests.vlm_fixtures import (
     DEFAULT_GRID_PINPOINTS,
     compare_logits_by_region,
     create_lev_jax_tensors,
     get_real_data,
     prepare_test_data,
 )
-from levanter.trainer import TrainerConfig
-from PIL import Image
-from transformers import AutoConfig
-
-from experiments.multimodality.base.train import compute_vlm_loss
 
 MODEL_NAME = "llava-hf/llava-onevision-qwen2-0.5b-si-hf"
 MODEL_NAME_7B = "llava-hf/llava-onevision-qwen2-7b-ov-hf"
@@ -372,10 +372,11 @@ def test_replace_tokenizer_qwen3():
     llm_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-1.7B")
 
     # Create BatchImageProcessor with Qwen3 tokenizer
-    bp = BatchImageProcessor(processor, tokenizer=llm_tokenizer, max_length=2048)
+    bp = BatchImageProcessor(
+        processor, tokenizer=llm_tokenizer, image_token="<|image_pad|>", video_token="<|video_pad|>", max_length=2048
+    )
 
-    # Verify CustomVLMProcessor is used with new tokenizer
-    assert isinstance(bp.processor, CustomVLMProcessor)
+    assert type(bp.processor) is type(processor)
     assert bp.processor.tokenizer is llm_tokenizer
 
     # Verify thinking tokens encode correctly (Qwen3-specific)
