@@ -65,6 +65,7 @@ from levanter.utils.py_utils import dataclass_with_default_init
 silence_transformer_nag()
 from transformers import (  # noqa: E402  # noqa: E402
     AutoConfig,
+    LlavaOnevisionConfig,
     AutoProcessor,
     AutoTokenizer,
     PreTrainedTokenizerBase,
@@ -975,7 +976,10 @@ class HFCheckpointConverter(Generic[LevConfig]):
 
         # Vocab: first we have to resize the vocab as loaded from the checkpoint
         tokenizer_Vocab = self.Vocab
-        Vocab = tokenizer_Vocab.resize(hf_config.vocab_size)
+        hf_vocab_size = (
+            hf_config.text_config.vocab_size if isinstance(hf_config, LlavaOnevisionConfig) else hf_config.vocab_size
+        )
+        Vocab = tokenizer_Vocab.resize(hf_vocab_size)
 
         # TODO: in an ideal world, we would only load the part of the array we needed, but
         # AFAICT neither torch state dicts nor safetensors support this.
