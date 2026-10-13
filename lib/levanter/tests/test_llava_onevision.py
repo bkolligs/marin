@@ -24,7 +24,7 @@ from haliax.partitioning import ResourceAxis
 from jax import random
 from jax.sharding import Mesh
 from levanter.compat.hf_checkpoints import from_torch_compatible_state_dict
-from levanter.data.image import create_custom_processor
+from levanter.data.onevision import create_custom_processor
 from levanter.inference.engine import InferenceEngineConfig
 from levanter.inference.jit_scheduler import SeqDecodingParams
 from levanter.models.qwen import QwenConfig
@@ -67,7 +67,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from levanter.testing.helpers import skip_if_no_torch, use_test_mesh
 
 # Import shared helper functions from test_image_utils
-from levanter.testing.vlm import (
+from lib.levanter.tests.vlm_fixtures import (
     DEFAULT_GRID_PINPOINTS,
     compare_logits_by_region,
     create_grid_mask,

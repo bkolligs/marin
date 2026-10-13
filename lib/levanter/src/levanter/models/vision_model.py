@@ -15,16 +15,13 @@ from haliax import Axis
 from levanter.compat.hf_checkpoints import HFCheckpointConverter
 
 
-# =====================
-# Vision Encoder Config
-# =====================
-
 VisionEncoderT = TypeVar("VisionEncoderT", bound=eqx.Module)
 
 
-# TODO: for some reason, mypy doesn't like the discover_packages_path argument?
 @dataclass(frozen=True)
-class VisionEncoderConfig(draccus.PluginRegistry, abc.ABC, Generic[VisionEncoderT], discover_packages_path="levanter.models"):  # type: ignore
+class VisionEncoderConfig(
+    draccus.PluginRegistry, abc.ABC, Generic[VisionEncoderT], discover_packages_path="levanter.models"
+):
     """
     Abstract base class for vision encoder configurations.
 
@@ -60,19 +57,3 @@ class VisionEncoderConfig(draccus.PluginRegistry, abc.ABC, Generic[VisionEncoder
     def hf_checkpoint_converter(self, ref_checkpoint: Optional[str] = None) -> HFCheckpointConverter:
         """Create a HuggingFace checkpoint converter for this config."""
         pass
-
-
-# =====================
-# Vision Encoder Model
-# =====================
-
-
-class VisionEncoderModel(abc.ABC):
-    """
-    Abstract base class for vision encoder models.
-
-    This is a placeholder for type hints. Concrete implementations
-    should inherit from both this class and equinox.Module.
-    """
-
-    pass

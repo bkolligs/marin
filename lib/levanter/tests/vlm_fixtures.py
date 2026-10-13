@@ -9,8 +9,8 @@ Provides unified data preparation for HF vs Levanter comparison testing.
 Uses Levanter's BatchImageProcessor for consistent processing with grid_mask support.
 """
 
-from levanter.data.image import create_custom_processor
-from transformers import AutoProcessor
+from levanter.data.onevision import create_custom_processor
+from transformers import ProcessorMixin
 from levanter.data.image import BatchImageProcessor
 from levanter.data.image import load_image
 import jax.numpy as jnp
@@ -24,145 +24,44 @@ import numpy as np
 from PIL import Image
 from PIL import Image as PILImage
 
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 
-
-# =============================================================================
-# HuggingFace Test Dataset Loading
-# =============================================================================
-# Utility functions for loading test data from HuggingFace dataset.
-# Uses the dataset `ruili0/demo-vlm-test-dataset` instead of local files.
-#
-# Dataset splits:
-# - single_image: 4 samples with single image QA (Stanford University entrance)
-# - multi_image: 4 samples with multi-image QA (same image used twice)
-# - real_data: 20 samples from real multimodal dataset
-# =============================================================================
 
 HF_DATASET = "ruili0/demo-vlm-test-dataset"
 
 
 @lru_cache(maxsize=1)
-def _load_single_image_split():
-    """Cache the single_image split to avoid repeated downloads."""
+def _load_single_image_split() -> Dataset:
     return load_dataset(HF_DATASET, split="single_image")
 
 
 @lru_cache(maxsize=1)
-def _load_multi_image_split():
-    """Cache the multi_image split to avoid repeated downloads."""
+def _load_multi_image_split() -> Dataset:
     return load_dataset(HF_DATASET, split="multi_image")
 
 
 @lru_cache(maxsize=1)
-def _load_real_data_split():
-    """Cache the real_data split to avoid repeated downloads."""
+def _load_real_data_split() -> Dataset:
     return load_dataset(HF_DATASET, split="real_data")
 
 
 def get_single_image() -> PILImage.Image:
-    """Get a single test image from HF dataset.
-
-    Returns:
-        PIL Image of Stanford University entrance.
-    """
     ds = _load_single_image_split()
     return ds[0]["images"][0]
 
 
 def get_multi_images() -> list[PILImage.Image]:
-    """Get multi-image test data from HF dataset.
-
-    Returns:
-        List of 2 PIL Images (same image twice, for multi-image testing).
-    """
     ds = _load_multi_image_split()
     return ds[0]["images"]
 
 
-def get_real_data(num_samples: int = 20):
-    """Get real test data from HF dataset.
-
-    Args:
-        num_samples: Number of samples to return (default 20, max 20).
-
-    Returns:
-        HuggingFace Dataset with messages and images columns.
-    """
+def get_real_data(num_samples: int = 20) -> Dataset:
     ds = _load_real_data_split()
     return ds.select(range(min(num_samples, len(ds))))
 
 
-def get_single_image_conversations():
-    """Get single image QA conversations.
-
-    Returns:
-        HuggingFace Dataset with 4 single-image QA samples.
-    """
-    return _load_single_image_split()
-
-
-def get_multi_image_conversations():
-    """Get multi-image QA conversations.
-
-    Returns:
-        HuggingFace Dataset with 4 multi-image QA samples.
-    """
-    return _load_multi_image_split()
-
-
-def get_test_conversation(split: str = "single_image", index: int = 0) -> dict:
-    """Get a specific test conversation.
-
-    Args:
-        split: One of "single_image", "multi_image", or "real_data".
-        index: Index of the sample to return.
-
-    Returns:
-        Dict with "messages" and "images" keys.
-    """
-    if split == "single_image":
-        ds = _load_single_image_split()
-    elif split == "multi_image":
-        ds = _load_multi_image_split()
-    elif split == "real_data":
-        ds = _load_real_data_split()
-    else:
-        raise ValueError(f"Unknown split: {split}. Use 'single_image', 'multi_image', or 'real_data'.")
-
-    return ds[index]
-
-
-def clear_cache():
-    """Clear the cached datasets (useful for testing)."""
-    _load_single_image_split.cache_clear()
-    _load_multi_image_split.cache_clear()
-    _load_real_data_split.cache_clear()
-
-
-# =============================================================================
-# Test Data Structures
-# =============================================================================
-# These dataclasses are used for testing HF vs Levanter implementation comparison.
-# They mirror the production structures (ImageTextDict, ImageTextExample) but are
-# kept separate for clarity in test code and to maintain both HF and Levanter
-# output formats side by side.
-#
-# Production equivalents:
-# - LevProcessedData ≈ ImageTextDict (from levanter.data.image)
-# - LevJaxTensors ≈ ImageTextExample (from levanter.data.image)
-# - HFProcessedData is test-only (for comparing with HF model outputs)
-# =============================================================================
-
-
 @dataclass
 class HFProcessedData:
-    """HF processor output (no padding, variable shape).
-
-    This represents the output format from HuggingFace's processor
-    with do_pad=False, resulting in variable-length sequences.
-    Used for comparing HF model outputs with Levanter.
-    """
 
     input_ids: np.ndarray  # (seq_len,)
     pixel_values: np.ndarray  # (num_patches, C, H, W) - variable num_patches
@@ -172,11 +71,6 @@ class HFProcessedData:
 
 @dataclass
 class LevProcessedData:
-    """Levanter processor output (padded, fixed shape with grid_mask).
-
-    This represents the output format for Levanter's JIT-compatible processing
-    with fixed shapes and grid_mask for indicating valid patches.
-    """
 
     input_ids: np.ndarray  # (seq_len,)
     pixel_values: np.ndarray  # (TOTAL_PATCHES, C, H, W) - fixed size, padded
@@ -188,11 +82,6 @@ class LevProcessedData:
 
 @dataclass
 class TestDataPair:
-    """Paired HF and Levanter data for comparison testing.
-
-    This provides both formats from the same source data,
-    enabling direct comparison between HF and Levanter implementations.
-    """
 
     hf: HFProcessedData
     lev: LevProcessedData
@@ -222,35 +111,22 @@ def _create_processors(
     patch_size: int,
     vision_feature_height: int,
     add_generation_prompt: bool = False,
-):
-    """Create HF and Levanter processors for test data preparation.
+) -> tuple[ProcessorMixin, BatchImageProcessor]:
+    # HF processor with do_pad=True and max_image_tiles for padding_mode support
+    hf_processor = create_custom_processor(
+        model_name,
+        do_pad=True,
+        image_grid_pinpoints=grid_pinpoints,
+        max_image_tiles=max_num_patches + 1,  # e.g., 10 for anyres_max_9
+    )
 
-    Returns:
-        Tuple of (hf_processor, lev_batch_processor)
-    """
-    # Try to import custom processor first (for proper do_pad support)
-    try:
-
-        # HF processor with do_pad=True and max_image_tiles for padding_mode support
-        hf_processor = create_custom_processor(
-            model_name,
-            do_pad=True,
-            image_grid_pinpoints=grid_pinpoints,
-            max_image_tiles=max_num_patches + 1,  # e.g., 10 for anyres_max_9
-        )
-
-        # Levanter processor with do_pad=True (padding, fixed shape)
-        lev_processor = create_custom_processor(
-            model_name,
-            do_pad=True,
-            image_grid_pinpoints=grid_pinpoints,
-            max_image_tiles=max_num_patches + 1,
-        )
-    except ImportError:
-        # Fallback to standard AutoProcessor
-
-        hf_processor = AutoProcessor.from_pretrained(model_name)
-        lev_processor = AutoProcessor.from_pretrained(model_name)
+    # Levanter processor with do_pad=True (padding, fixed shape)
+    lev_processor = create_custom_processor(
+        model_name,
+        do_pad=True,
+        image_grid_pinpoints=grid_pinpoints,
+        max_image_tiles=max_num_patches + 1,
+    )
 
     # Wrap Levanter processor in BatchImageProcessor for consistent grid_mask handling
 
@@ -279,42 +155,6 @@ def prepare_test_data(
     vision_feature_height: int = 27,
     add_generation_prompt: bool = False,
 ) -> list[TestDataPair]:
-    """
-    Prepare test data pairs for HF vs Levanter comparison.
-
-    Uses Levanter's BatchImageProcessor for the Levanter format (with grid_mask),
-    and raw HF processor for the HF format (no padding).
-
-    This function uses create_custom_processor from levanter.data.image
-    to ensure proper do_pad handling for HF (do_pad=False) and Levanter (do_pad=True).
-
-    Args:
-        parquet_path: Path to parquet dataset file
-        sample_indices: List of sample indices to process
-        model_name: HuggingFace model name for processor
-        max_length: Maximum sequence length for tokenization
-        max_num_patches: Maximum number of patches for anyres (e.g., 9 for anyres_max_9)
-        grid_pinpoints: Grid resolutions for anyres processing.
-                        If None, uses DEFAULT_GRID_PINPOINTS.
-        patch_size: Size of each image patch (default 384)
-        vision_feature_height: Vision encoder output tokens per spatial dim (default 27 = 384/14)
-        add_generation_prompt: Whether to add generation prompt (default False)
-
-    Returns:
-        List of TestDataPair, one per sample index
-
-    Example:
-        >>> test_pairs = prepare_test_data(
-        ...     parquet_path="data/train.parquet",
-        ...     sample_indices=[0, 1, 2, 3],
-        ... )
-        >>> for pair in test_pairs:
-        ...     # HF data is unpadded
-        ...     print(f"HF pixel_values shape: {pair.hf.pixel_values.shape}")
-        ...     # Levanter data is padded with grid_mask
-        ...     print(f"Lev pixel_values shape: {pair.lev.pixel_values.shape}")
-        ...     print(f"Lev grid_mask: {pair.lev.grid_mask.sum()} valid patches")
-    """
 
     # Use default grid_pinpoints if not provided
     if grid_pinpoints is None:
@@ -398,34 +238,6 @@ def prepare_test_data_single(
     vision_feature_height: int = 27,
     add_generation_prompt: bool = False,
 ) -> TestDataPair:
-    """
-    Prepare a single test data pair from messages and images directly.
-
-    This is useful when you have raw messages and images rather than a parquet file.
-
-    Args:
-        messages: List of message dicts in conversation format
-        images: List of PIL Image objects
-        model_name: HuggingFace model name for processor
-        max_length: Maximum sequence length for tokenization
-        max_num_patches: Maximum number of patches for anyres
-        grid_pinpoints: Grid resolutions for anyres processing
-        patch_size: Size of each image patch
-        vision_feature_height: Vision encoder output tokens per spatial dim
-        add_generation_prompt: Whether to add generation prompt (default False)
-
-    Returns:
-        TestDataPair with both HF and Levanter formats
-
-    Example:
-        >>> from PIL import Image
-        >>> messages = [
-        ...     {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "What is this?"}]},
-        ...     {"role": "assistant", "content": [{"type": "text", "text": "A cat."}]}
-        ... ]
-        >>> images = [Image.open("cat.jpg")]
-        >>> pair = prepare_test_data_single(messages, images)
-    """
     # Use default grid_pinpoints if not provided
     if grid_pinpoints is None:
         grid_pinpoints = DEFAULT_GRID_PINPOINTS
@@ -495,36 +307,12 @@ def prepare_test_data_single(
 
 
 def create_grid_mask(actual_patches: int, total_patches: int) -> np.ndarray:
-    """Create grid mask for fixed-shape image processing.
-
-    This function creates a boolean mask indicating which patches are valid (True)
-    vs padding (False). Used for JIT-compatible VLM training.
-
-    Args:
-        actual_patches: Number of actual valid patches from the image
-        total_patches: Total number of patches (including padding slots)
-
-    Returns:
-        Boolean array of shape (total_patches,) where True indicates valid patches
-    """
     grid_mask = np.zeros(total_patches, dtype=np.bool_)
     grid_mask[:actual_patches] = True
     return grid_mask
 
 
 def pad_pixel_values(pixel_values: np.ndarray, total_patches: int) -> np.ndarray:
-    """Pad pixel_values to fixed total_patches size.
-
-    This function pads the pixel_values array to have a fixed number of patches,
-    enabling JIT-compatible fixed-shape processing.
-
-    Args:
-        pixel_values: Array of shape (actual_patches, C, H, W)
-        total_patches: Target number of patches
-
-    Returns:
-        Padded array of shape (total_patches, C, H, W)
-    """
     actual_patches = pixel_values.shape[0]
     if actual_patches >= total_patches:
         return pixel_values[:total_patches]
@@ -534,24 +322,11 @@ def pad_pixel_values(pixel_values: np.ndarray, total_patches: int) -> np.ndarray
 
 
 def get_actual_patches_from_grid_mask(grid_mask: np.ndarray) -> int:
-    """Get the number of actual (non-padding) patches from a grid_mask.
-
-    Args:
-        grid_mask: Boolean array where True indicates valid patches
-
-    Returns:
-        Number of valid patches
-    """
     return int(grid_mask.sum())
 
 
 @dataclass
 class LogitsComparisonResult:
-    """Result of comparing logits between HF and Levanter.
-
-    When detailed=True, contains statistics for each region (pre-image, image, post-image).
-    When detailed=False, only overall_mean_diff and overall_max_diff are populated.
-    """
 
     overall_mean_diff: float
     overall_max_diff: float
@@ -576,24 +351,6 @@ def compare_logits_by_region(
     detailed: bool = True,
     attention_mask: Optional[np.ndarray] = None,
 ) -> LogitsComparisonResult:
-    """
-    Compare logits between HF and Levanter.
-
-    Args:
-        hf_logits: HF model logits (seq_len, vocab_size)
-        lev_logits: Levanter model logits (seq_len, vocab_size)
-        input_ids: Token IDs to identify image token positions
-        image_token_id: Token ID for image placeholders
-        tolerance: Max mean diff for pass/fail determination
-        verbose: Print comparison results
-        detailed: If True, split by pre-image/image/post-image regions.
-                  If False, only compute overall diff for masked positions (faster).
-        attention_mask: Optional mask for valid positions (1=valid, 0=padding).
-                        Required when detailed=False to exclude padding.
-
-    Returns:
-        LogitsComparisonResult with comparison statistics
-    """
     # Ensure same sequence length
     seq_len = min(hf_logits.shape[0], lev_logits.shape[0])
     hf_logits = hf_logits[:seq_len]
@@ -720,18 +477,6 @@ def verify_pixel_values_consistency(
     rtol: float = 1e-5,
     atol: float = 1e-5,
 ) -> bool:
-    """Verify that HF and Levanter pixel values match for valid patches.
-
-    Args:
-        hf_pixel_values: HF pixel values (num_patches, C, H, W)
-        lev_pixel_values: Levanter pixel values (TOTAL_PATCHES, C, H, W)
-        grid_mask: Boolean mask for valid patches
-        rtol: Relative tolerance for comparison
-        atol: Absolute tolerance for comparison
-
-    Returns:
-        True if pixel values match within tolerance
-    """
     actual_patches = get_actual_patches_from_grid_mask(grid_mask)
 
     # Extract valid patches from Levanter output
@@ -743,11 +488,6 @@ def verify_pixel_values_consistency(
 
 @dataclass
 class LevJaxTensors:
-    """JAX/Haliax NamedArrays for Levanter model input.
-
-    This dataclass holds all the NamedArrays needed to run a Levanter VLM model,
-    created from LevProcessedData.
-    """
 
     input_ids: Any  # NamedArray (Batch, Position)
     pixel_values: Any  # NamedArray (Batch, NumPatches, Channels, Height, Width)
@@ -769,28 +509,6 @@ def create_lev_jax_tensors(
     lev_data: LevProcessedData,
     batch_size: int = 1,
 ) -> LevJaxTensors:
-    """Convert LevProcessedData to JAX/Haliax NamedArrays for Levanter model.
-
-    This function creates all the NamedArrays needed to run a Levanter VLM model
-    from the LevProcessedData output of prepare_test_data().
-
-    Args:
-        lev_data: Levanter processed data with numpy arrays
-        batch_size: Batch size (default 1 for single sample)
-
-    Returns:
-        LevJaxTensors with all NamedArrays ready for model forward pass
-
-    Example:
-        >>> test_pairs = prepare_test_data(parquet_path, sample_indices=[0])
-        >>> jax_tensors = create_lev_jax_tensors(test_pairs[0].lev)
-        >>> logits = lev_model(
-        ...     jax_tensors.input_ids,
-        ...     pixel_values=jax_tensors.pixel_values,
-        ...     grid_mask=jax_tensors.grid_mask,
-        ...     unpad_indices=jax_tensors.unpad_indices,
-        ... )
-    """
 
     seq_len = len(lev_data.input_ids)
 
