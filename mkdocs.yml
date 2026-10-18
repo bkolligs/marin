@@ -80,6 +80,7 @@ nav:
       - Lazy artifacts: explanations/lazy-artifacts.md
       - Guidelines: explanations/guidelines.md
   - Experiments:
+      - Multimodal Template: experiments/multimodal-template.md
       - Daily Ferry Log: experiments/daily-ferry-log.md
       - Report Index: reports/index.md
       - Agent MoE Experiment Digest: reports/agent-moe-experiments.md
