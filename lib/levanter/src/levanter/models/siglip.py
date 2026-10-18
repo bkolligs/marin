@@ -1,24 +1,22 @@
 # Copyright The Levanter Authors
 # SPDX-License-Identifier: Apache-2.0
 
-# Copyright The Levanter Authors
-# SPDX-License-Identifier: Apache-2.0
 
-
-import numpy as np
 from haliax._src.state_dict import default_eqx_module_from_state_dict
 
 
 from jaxtyping import PRNGKeyArray
-from dataclasses import dataclass
-from typing import Self, Callable, Dict, Optional, Tuple, Type
+from dataclasses import dataclass, replace
+from typing import Self, Dict, Optional, Tuple, Type
 from levanter.utils.activation import ActivationFunctionEnum
 from levanter.utils.logging import silence_transformer_nag
 from levanter.models.vision_model import VisionEncoderConfig
+from levanter.models.vision_model import vision_activation, vision_hidden_states, VisionEncoderLayer
 
 
 silence_transformer_nag()
 from transformers import PretrainedConfig as HfConfig  # noqa: E402
+from transformers import SiglipConfig as HfSiglipConfig  # noqa: E402
 from transformers import SiglipVisionConfig as HfSiglipVisionConfig  # noqa: E402
 
 import equinox as eqx  # noqa: E402
@@ -29,10 +27,10 @@ import haliax.nn as hnn  # noqa: E402
 from haliax import Axis, NamedArray  # noqa: E402
 from haliax.jax_utils import maybe_rng_split, named_call, shaped_rng_split  # noqa: E402
 from haliax.nn.scan import Stacked  # noqa: E402
-from haliax.state_dict import ModuleWithStateDictSerialization  # noqa: E402
+from haliax.state_dict import ModuleWithStateDictSerialization, with_prefix  # noqa: E402
 
 from levanter.compat.hf_checkpoints import HFCheckpointConverter, ModelWithHfSerializationMixin  # noqa: E402
-from levanter.layers.attention import AttentionBackend, AttentionMask, dot_product_attention  # noqa: E402
+from levanter.layers.attention import AttentionBackend, AttentionMask  # noqa: E402
 
 
 @dataclass
@@ -74,7 +72,6 @@ class SiglipVisionConfig(VisionEncoderConfig["SiglipVisionModel"]):
         hidden_act: The non-linear activation function.
         layer_norm_eps: The epsilon used by the layer normalization layers.
         attention_dropout: The dropout ratio for the attention probabilities.
-        initializer_range: The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
         gradient_checkpointing: Whether to use gradient checkpointing to save memory.
         use_flash_attention: Whether to use flash attention.
         attn_backend: Attention backend to use (if None, uses default).
@@ -92,29 +89,23 @@ class SiglipVisionConfig(VisionEncoderConfig["SiglipVisionModel"]):
     hidden_act: ActivationFunctionEnum = ActivationFunctionEnum.gelu_new
     layer_norm_eps: float = 1e-6
     attention_dropout: float = 0.0
-    initializer_range: float = 0.02
     gradient_checkpointing: bool = True
 
-    # Attention-related config
     use_flash_attention: bool = True
     attn_backend: Optional[AttentionBackend] = None
     flash_attention_block_size: Optional[int] = None
     inference: bool = True  # Whether to run in inference mode (disables dropout)
 
-    # Reference checkpoint for loading pretrained models
     reference_checkpoint: Optional[str] = None
 
     def hf_checkpoint_converter(
         self, ref_checkpoint: Optional[str] = None
     ) -> HFCheckpointConverter["SiglipVisionConfig"]:  # type: ignore
         """Create HuggingFace checkpoint converter for this config."""
-        # Vision-only models don't have a tokenizer, but HFCheckpointConverter requires one
-        # Use gpt2 tokenizer as a placeholder since it's always available
         return HFCheckpointConverter(
             self.__class__,
             reference_checkpoint=self.reference_checkpoint if ref_checkpoint is None else ref_checkpoint,
             trust_remote_code=False,
-            tokenizer="gpt2",  # Dummy tokenizer for vision-only model
             HfConfigClass=HfSiglipVisionConfig,
         )
 
@@ -126,32 +117,13 @@ class SiglipVisionConfig(VisionEncoderConfig["SiglipVisionModel"]):
         - SiglipVisionConfig directly (has hidden_act attribute)
         - SiglipConfig (has vision_config nested inside)
         """
-        # If this is a full SiglipConfig, extract the vision_config
-        if hasattr(hf_config, "vision_config") and not hasattr(hf_config, "hidden_act"):
-            hf_config = hf_config.vision_config
+        if isinstance(hf_config, HfSiglipConfig):
+            vision_config = hf_config.vision_config
+            assert isinstance(vision_config, HfSiglipVisionConfig)
+            hf_config = vision_config
+        assert isinstance(hf_config, HfSiglipVisionConfig)
 
-        # Extract activation function, handle both string and enum
-        hidden_act = hf_config.hidden_act
-        if isinstance(hidden_act, str):
-            # Map HF activation names to our enum
-            # Note: gelu_pytorch_tanh in HF maps to gelu_new in Levanter (approximate GELU)
-            if hidden_act == "gelu_pytorch_tanh":
-                activation_fn = ActivationFunctionEnum.gelu_new
-            elif hidden_act == "gelu":
-                activation_fn = ActivationFunctionEnum.gelu
-            elif hidden_act == "gelu_new":
-                activation_fn = ActivationFunctionEnum.gelu_new
-            elif hidden_act == "relu":
-                activation_fn = ActivationFunctionEnum.relu
-            elif hidden_act == "silu" or hidden_act == "swish":
-                activation_fn = ActivationFunctionEnum.silu
-            elif hidden_act == "quick_gelu":
-                activation_fn = ActivationFunctionEnum.quick_gelu
-            else:
-                # Default to gelu_new for unknown activations
-                activation_fn = ActivationFunctionEnum.gelu_new
-        else:
-            activation_fn = ActivationFunctionEnum.gelu_new
+        activation_fn = vision_activation(hf_config.hidden_act)
 
         return cls(
             hidden_size=hf_config.hidden_size,
@@ -173,11 +145,9 @@ class SiglipVisionConfig(VisionEncoderConfig["SiglipVisionModel"]):
             vocab_size: Vocabulary size (unused for vision-only models, but required by interface)
             config_overrides: Optional config overrides
         """
-        # vocab_size is not used for vision-only models, but required by the interface
         if config_overrides is None:
             config_overrides = {}
 
-        # Map activation function back to HF format
         # gelu_new in Levanter maps back to gelu_pytorch_tanh in HF (for SigLIP compatibility)
         if isinstance(self.hidden_act, ActivationFunctionEnum):
             if self.hidden_act == ActivationFunctionEnum.gelu_new:
@@ -187,7 +157,6 @@ class SiglipVisionConfig(VisionEncoderConfig["SiglipVisionModel"]):
         else:
             hf_hidden_act = self.hidden_act
 
-        # Build config dict with defaults from self
         config_dict = {
             "hidden_size": self.hidden_size,
             "intermediate_size": self.intermediate_size,
@@ -201,7 +170,6 @@ class SiglipVisionConfig(VisionEncoderConfig["SiglipVisionModel"]):
             "attention_dropout": self.attention_dropout,
         }
 
-        # Apply overrides
         config_dict.update(config_overrides)
 
         hf_config = HfSiglipVisionConfig(**config_dict)
@@ -213,7 +181,6 @@ class SiglipVisionConfig(VisionEncoderConfig["SiglipVisionModel"]):
         """Return the corresponding model class."""
         return SiglipVisionModel
 
-    # Axis definitions following Levanter patterns
     @property
     def Embed(self) -> Axis:
         """Embedding dimension axis."""
@@ -261,290 +228,6 @@ class SiglipVisionConfig(VisionEncoderConfig["SiglipVisionModel"]):
         return Axis(name="num_patches", size=num_patches)
 
 
-class SiglipMLP(eqx.Module):
-    """
-    MLP module for SigLIP Vision Transformer.
-
-    Implements a two-layer feedforward network with activation function in between.
-    """
-
-    fc1: hnn.Linear  # projection from Embed to Mlp (intermediate)
-    fc2: hnn.Linear  # projection from Mlp to Embed
-    act: Callable = eqx.field(static=True)
-
-    @staticmethod
-    def init(Embed: Axis, Mlp: Axis, activation_fn: ActivationFunctionEnum, *, key: PRNGKeyArray) -> "SiglipMLP":
-        """
-        Initialize SiglipMLP.
-
-        Args:
-            Embed: Embedding dimension axis
-            Mlp: MLP intermediate dimension axis
-            activation_fn: Activation function enum
-            key: PRNGKey for initialization
-
-        Returns:
-            Initialized SiglipMLP module
-        """
-        k_fc1, k_fc2 = maybe_rng_split(key, 2)
-
-        # In SigLIP, fc1 goes from hidden_size to intermediate_size
-        fc1 = hnn.Linear.init(In=Embed, Out=Mlp, key=k_fc1, use_bias=True, out_first=True)
-        # fc2 goes from intermediate_size back to hidden_size
-        fc2 = hnn.Linear.init(In=Mlp, Out=Embed, key=k_fc2, use_bias=True, out_first=True)
-
-        # Convert activation function enum to callable
-        activation_fn_callable = (
-            activation_fn.to_fn() if isinstance(activation_fn, ActivationFunctionEnum) else activation_fn
-        )
-
-        return SiglipMLP(fc1, fc2, activation_fn_callable)
-
-    @named_call
-    def __call__(self, x: NamedArray, *, key: PRNGKeyArray | None = None) -> NamedArray:
-        """
-        Forward pass through MLP.
-
-        Args:
-            x: Input tensor with Embed axis
-            key: Optional PRNGKey for dropout (not used in SigLIP)
-
-        Returns:
-            Output tensor with Embed axis
-        """
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.fc2(x)
-        return x
-
-
-class SiglipAttention(eqx.Module):
-    """
-    Multi-headed attention module for SigLIP.
-
-    Implements standard multi-head self-attention with separate Q, K, V projections
-    and an output projection.
-    """
-
-    config: SiglipVisionConfig = eqx.field(static=True)
-    q_proj: hnn.Linear  # Query projection from Embed to (Heads, HeadSize)
-    k_proj: hnn.Linear  # Key projection from Embed to (Heads, HeadSize)
-    v_proj: hnn.Linear  # Value projection from Embed to (Heads, HeadSize)
-    out_proj: hnn.Linear  # Output projection from (Heads, HeadSize) to Embed
-
-    @staticmethod
-    def init(config: SiglipVisionConfig, *, key: PRNGKeyArray) -> "SiglipAttention":
-        """
-        Initialize SiglipAttention.
-
-        Args:
-            config: SiglipVisionConfig
-            key: PRNGKey for initialization
-
-        Returns:
-            Initialized SiglipAttention module
-        """
-        k_q, k_k, k_v, k_out = maybe_rng_split(key, 4)
-
-        Embed = config.Embed
-        Heads = config.Heads
-        HeadSize = config.HeadSize
-
-        # Initialize projection layers
-        # All projections use bias in SigLIP
-        q_proj = hnn.Linear.init(In=Embed, Out=(Heads, HeadSize), key=k_q, use_bias=True, out_first=True)
-        k_proj = hnn.Linear.init(In=Embed, Out=(Heads, HeadSize), key=k_k, use_bias=True, out_first=True)
-        v_proj = hnn.Linear.init(In=Embed, Out=(Heads, HeadSize), key=k_v, use_bias=True, out_first=True)
-        out_proj = hnn.Linear.init(In=(Heads, HeadSize), Out=Embed, key=k_out, use_bias=True, out_first=True)
-
-        return SiglipAttention(config, q_proj, k_proj, v_proj, out_proj)
-
-    @named_call
-    def __call__(
-        self,
-        x: NamedArray,
-        mask: Optional[AttentionMask] = None,
-        *,
-        key: PRNGKeyArray | None = None,
-    ) -> NamedArray:
-        """
-        Forward pass through attention.
-
-        Args:
-            x: Input tensor with shape (..., seq, embed) where seq can be "num_patches" or "position"
-            mask: Optional attention mask
-            key: PRNGKey for dropout
-
-        Returns:
-            Output tensor with shape (..., seq, embed)
-        """
-        k_drop = maybe_rng_split(key, 1)[0] if key is not None else None
-
-        # Find the sequence axis (num_patches or position)
-        seq_axis_name = None
-        embed_axis = self.config.Embed
-        for ax in x.axes:
-            if ax.name in ("num_patches", "position"):
-                seq_axis_name = ax.name
-                break
-        if seq_axis_name is None:
-            # Fallback: find first axis that's not embed or batch
-            for ax in x.axes:
-                if ax != embed_axis and ax.name not in ("batch", "Batch"):
-                    seq_axis_name = ax.name
-                    break
-        if seq_axis_name is None:
-            raise ValueError(f"Could not find sequence axis in input {x.axes}")
-
-        # Project to Q, K, V
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-
-        # Compute padding for Splash Attention (requires sequence length to be multiple of 128)
-        seq_axis = q.resolve_axis(seq_axis_name)
-        orig_seq_len = seq_axis.size
-        SPLASH_BLOCK_SIZE = 128
-        pad_len = (SPLASH_BLOCK_SIZE - (orig_seq_len % SPLASH_BLOCK_SIZE)) % SPLASH_BLOCK_SIZE
-
-        if pad_len > 0:
-            # Pad q, k, v with zeros along sequence dimension
-            q = hax.pad(q, {seq_axis_name: (0, pad_len)})
-            k = hax.pad(k, {seq_axis_name: (0, pad_len)})
-            v = hax.pad(v, {seq_axis_name: (0, pad_len)})
-
-            # Create padded axes
-            padded_seq_len = orig_seq_len + pad_len
-            PaddedSeqAxis = Axis(seq_axis_name, padded_seq_len)
-            PaddedKeyAxis = Axis("key_position", padded_seq_len)
-
-            # Create attention mask to ignore padded positions using numpy for static mask
-            # This allows Splash Attention to use NumpyMask which requires static arrays
-
-            q_indices = np.arange(padded_seq_len)
-            k_indices = np.arange(padded_seq_len)
-            # Create 2D mask: valid positions are where both q and k indices < orig_seq_len
-            pad_mask_np = (q_indices[:, None] < orig_seq_len) & (k_indices[None, :] < orig_seq_len)
-            # Wrap as NamedArray for AttentionMask
-            pad_mask = hax.named(pad_mask_np, (PaddedSeqAxis, PaddedKeyAxis))
-
-            # Combine with existing mask if present
-            if mask is not None:
-                combined_mask = AttentionMask.explicit(pad_mask) & mask
-            else:
-                combined_mask = AttentionMask.explicit(pad_mask)
-
-            # Rename k and v's sequence axis to key_position
-            k = k.rename({seq_axis_name: "key_position"})
-            v = v.rename({seq_axis_name: "key_position"})
-        else:
-            # No padding needed
-            combined_mask = mask
-            k = k.rename({seq_axis_name: "key_position"})
-            v = v.rename({seq_axis_name: "key_position"})
-
-        attn_output = dot_product_attention(
-            seq_axis_name,
-            "key_position",
-            "head_size",
-            q,
-            k,
-            v,
-            mask=combined_mask,
-            inference=self.config.inference,
-            use_flash=self.config.use_flash_attention,
-            attn_backend=self.config.attn_backend,
-            flash_block_size=self.config.flash_attention_block_size,
-            dropout=self.config.attention_dropout,
-            prng=k_drop,
-            attention_dtype=x.dtype,
-        )
-
-        # Remove padding from output if we added it
-        if pad_len > 0:
-            attn_output = attn_output[seq_axis_name, :orig_seq_len]
-
-        # Project back to embedding dimension
-        return self.out_proj(attn_output.astype(x.dtype))
-
-
-class SiglipEncoderLayer(eqx.Module):
-    """
-    SigLIP Encoder Layer.
-
-    Implements a transformer encoder layer with:
-    - Pre-LayerNorm architecture
-    - Self-attention with residual connection
-    - MLP with residual connection
-    """
-
-    config: SiglipVisionConfig = eqx.field(static=True)
-    layer_norm1: hnn.LayerNorm  # Pre-attention layer norm
-    self_attn: SiglipAttention  # Self-attention module
-    layer_norm2: hnn.LayerNorm  # Pre-MLP layer norm
-    mlp: SiglipMLP  # MLP module
-
-    @staticmethod
-    def init(config: SiglipVisionConfig, *, key: PRNGKeyArray) -> "SiglipEncoderLayer":
-        """
-        Initialize SiglipEncoderLayer.
-
-        Args:
-            config: SiglipVisionConfig
-            key: PRNGKey for initialization
-
-        Returns:
-            Initialized SiglipEncoderLayer module
-        """
-        k_attn, k_mlp = maybe_rng_split(key, 2)
-
-        # Initialize layer norms (with bias in SigLIP)
-        layer_norm1 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_eps, use_bias=True)
-        layer_norm2 = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_eps, use_bias=True)
-
-        # Initialize attention and MLP
-        self_attn = SiglipAttention.init(config, key=k_attn)
-        mlp = SiglipMLP.init(config.Embed, config.Mlp, config.hidden_act, key=k_mlp)
-
-        return SiglipEncoderLayer(config, layer_norm1, self_attn, layer_norm2, mlp)
-
-    @named_call
-    def __call__(
-        self,
-        x: NamedArray,
-        mask: Optional[AttentionMask] = None,
-        *,
-        key: PRNGKeyArray | None = None,
-    ) -> NamedArray:
-        """
-        Forward pass through encoder layer.
-
-        Args:
-            x: Input tensor with shape (..., position, embed)
-            mask: Optional attention mask
-            key: PRNGKey for dropout
-
-        Returns:
-            Output tensor with shape (..., position, embed)
-        """
-        k_attn, k_mlp = maybe_rng_split(key, 2)
-
-        # Self-attention block with pre-norm and residual
-        residual = x
-        x_norm = self.layer_norm1(x)
-        attn_output = self.self_attn(x_norm, mask=mask, key=k_attn)
-        x = residual + attn_output
-
-        # MLP block with pre-norm and residual
-        residual = x
-        x_norm = self.layer_norm2(x)
-
-        mlp_output = self.mlp(x_norm, key=k_mlp)
-        x = residual + mlp_output
-
-        return x
-
-
 class SiglipVisionEmbeddings(eqx.Module):
     """
     Vision embeddings for SigLIP.
@@ -578,7 +261,6 @@ class SiglipVisionEmbeddings(eqx.Module):
         Out_Features = config.Embed
         patch_size = config.patch_size
 
-        # Define spatial dimensions for the input image
         Height = Axis("height", config.image_size)
         Width = Axis("width", config.image_size)
 
@@ -593,7 +275,6 @@ class SiglipVisionEmbeddings(eqx.Module):
             use_bias=True,
         )
 
-        # Position embedding: learnable embeddings for each patch position
         # For standard SigLIP, this is (num_patches,) where num_patches = (image_size // patch_size)^2
         position_embedding = hnn.Embedding.init(
             config.NumPatches,
@@ -615,9 +296,6 @@ class SiglipVisionEmbeddings(eqx.Module):
         Returns:
             Embeddings with position information added, shape (batch, num_patches, embed)
         """
-        # Apply patch embeddings using Conv2d
-        # Input: (batch, channels, height, width)
-        # Output: (batch, embed, h_patches, w_patches)
         patch_embeds = self.patch_embedding(pixel_values, key=key)
 
         # Flatten spatial dimensions (h_patches, w_patches) into num_patches
@@ -626,7 +304,6 @@ class SiglipVisionEmbeddings(eqx.Module):
         embed_axis = self.config.Embed
         spatial_axes = [ax for ax in patch_embeds.axes if ax.name in ("height", "width")]
 
-        # Flatten spatial dims into num_patches
         num_patches_total = 1
         for ax in spatial_axes:
             num_patches_total *= ax.size
@@ -634,12 +311,9 @@ class SiglipVisionEmbeddings(eqx.Module):
 
         patch_embeds = hax.flatten_axes(patch_embeds, spatial_axes, NumPatchesActual)
 
-        # Rearrange to put num_patches before embed: (batch, embed, num_patches) -> (batch, num_patches, embed)
-        # Get all axes except embed and num_patches (i.e., batch if present), then num_patches, then embed
         other_axes = [ax for ax in patch_embeds.axes if ax not in (embed_axis, NumPatchesActual)]
         patch_embeds = patch_embeds.rearrange((*other_axes, NumPatchesActual, embed_axis))
 
-        # Add position embeddings
         position_ids = hax.arange(NumPatchesActual)
         pos_embeds = self.position_embedding(position_ids)
 
@@ -658,7 +332,7 @@ class SiglipVisionTransformer(ModuleWithStateDictSerialization):
 
     config: SiglipVisionConfig = eqx.field(static=True)
     embeddings: SiglipVisionEmbeddings
-    layers: Stacked[SiglipEncoderLayer]
+    layers: Stacked[VisionEncoderLayer]
     post_layernorm: hnn.LayerNorm
 
     def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
@@ -679,17 +353,14 @@ class SiglipVisionTransformer(ModuleWithStateDictSerialization):
         """
         k_embed, k_layers = maybe_rng_split(key, 2)
 
-        # Initialize embeddings
         embeddings = SiglipVisionEmbeddings.init(config, key=k_embed)
 
-        # Initialize stacked encoder layers
         layers = Stacked.init(
             config.Layers,
-            SiglipEncoderLayer,
+            VisionEncoderLayer,
             gradient_checkpointing=config.gradient_checkpointing,
         )(config, key=shaped_rng_split(k_layers, config.num_hidden_layers))
 
-        # Post-encoder layer norm
         post_layernorm = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_eps, use_bias=True)
 
         return SiglipVisionTransformer(config, embeddings, layers, post_layernorm)
@@ -723,41 +394,16 @@ class SiglipVisionTransformer(ModuleWithStateDictSerialization):
         """
         k_embed, k_layers = maybe_rng_split(key, 2)
 
-        # Get embeddings
         hidden_states = self.embeddings(pixel_values, key=k_embed)
 
-        # Pass through encoder layers
-        keys = maybe_rng_split(k_layers, self.config.num_hidden_layers) if k_layers is not None else None
+        hidden_states, result_hidden_states = vision_hidden_states(
+            self.layers,
+            hidden_states,
+            mask,
+            output_hidden_states,
+            key=k_layers,
+        )
 
-        if output_hidden_states:
-            # Use scan_via to collect hidden states from each layer
-            all_hidden_states = [hidden_states]  # Start with embeddings
-
-            def apply_layer(
-                block: SiglipEncoderLayer,
-                carry: NamedArray,
-                mask_arg: AttentionMask | NamedArray | None,
-                key_arg: PRNGKeyArray | None,
-            ) -> tuple[NamedArray, NamedArray]:
-                """Apply a single layer and return (new_carry, output_to_collect)"""
-                new_carry = block(carry, mask_arg, key=key_arg)
-                return new_carry, new_carry
-
-            # Use scan_via to apply each layer and collect outputs
-            hidden_states, stacked_layer_outputs = self.layers.scan_via(apply_layer)(hidden_states, mask, keys)
-
-            # Unbind the stacked outputs to get a list of hidden states
-            layer_outputs_list = hax.unbind(stacked_layer_outputs, self.config.Layers)
-            all_hidden_states.extend(layer_outputs_list)
-            result_hidden_states: Optional[Tuple[NamedArray, ...]] = tuple(all_hidden_states)
-        else:
-            # Use fold for efficient processing when we don't need intermediate states
-            hidden_states = self.layers.fold(hidden_states, mask, key=keys)
-            # Still provide the last layer output (before post_layernorm) for vision_feature_layer=-1
-            # This allows callers to use hidden_states[-1] without requiring output_hidden_states=True
-            result_hidden_states = (hidden_states,)
-
-        # Apply post-layer normalization
         last_hidden_state = self.post_layernorm(hidden_states)
 
         return SiglipVisionModelOutput(last_hidden_state=last_hidden_state, hidden_states=result_hidden_states)
@@ -784,7 +430,7 @@ class SiglipVisionModel(ModuleWithStateDictSerialization, ModelWithHfSerializati
         return Axis(name="vocab", size=1)
 
     def get_hf_config(self) -> HfConfig:
-        """Override to avoid requiring vocab_size for vision models."""
+        """Return the Hugging Face vision configuration."""
         return self.config.to_hf_config()
 
     @classmethod
@@ -833,16 +479,8 @@ class SiglipVisionModel(ModuleWithStateDictSerialization, ModelWithHfSerializati
     def from_state_dict(self, state_dict: Dict[str, jnp.ndarray], prefix: Optional[str] = None) -> Self:
         """Load from state dict."""
 
-        # Use default loading
+        # Standalone HF vision checkpoints omit the composite model's vision_model prefix.
+        if with_prefix(prefix, "embeddings.patch_embedding.weight") in state_dict:
+            vision_model = default_eqx_module_from_state_dict(self.vision_model, state_dict, prefix)
+            return replace(self, vision_model=vision_model)
         return default_eqx_module_from_state_dict(self, state_dict, prefix)
-
-
-__all__ = [
-    "SiglipVisionConfig",
-    "SiglipMLP",
-    "SiglipAttention",
-    "SiglipEncoderLayer",
-    "SiglipVisionEmbeddings",
-    "SiglipVisionTransformer",
-    "SiglipVisionModel",
-]
