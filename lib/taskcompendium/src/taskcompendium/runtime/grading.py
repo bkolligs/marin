@@ -24,7 +24,7 @@ from uuid import uuid4
 from shellbox.machine import Command, ExitReason, Machine, MachineFactory, MachineSpec, Result
 from verifyit.spec import Spec, render_spec
 
-from taskcompendium.grading import answer_submission, parse_grade_result
+from taskcompendium.grading import answer_submission, parse_grade_result, terminal_grade
 from taskcompendium.grading_result import GradeResult, GradingFailure, Outcome
 from taskcompendium.models import (
     CONVERSATION_ANSWERS,
@@ -57,7 +57,7 @@ from taskcompendium.models import (
 from taskcompendium.runtime.environment import prepare_machine_spec, resolve_env_vars, setup_user, validate_machine_spec
 from taskcompendium.runtime.output_capture import selected_output_files
 from taskcompendium.runtime.staging import StagedFile, resource_files, write_archive
-from taskcompendium.submission import conversation_messages, require_submission_compatibility
+from taskcompendium.submission import conversation_messages, native_action_text, require_submission_compatibility
 
 GRADING_TIMEOUT = 600.0
 SPEC_PATH = "/tests/verifier.toml"
@@ -82,10 +82,12 @@ class _StepFailed(Exception):
 
 
 def _verifyit_answer_bytes(submission: Submission) -> bytes:
-    """A text or JSON submission as the verifyit spec's answer file."""
+    """A text, JSON or native-action submission as the verifyit spec's answer file."""
     match submission:
         case TextSubmission(value=value):
             return value.encode()
+        case ActionSubmission(message=message):
+            return native_action_text(message).encode()
         case JsonSubmission(value=value):
             return json.dumps(value, allow_nan=False).encode()
     raise TypeError(f"A {type(submission).__name__} cannot be written as an answer file")
@@ -454,7 +456,11 @@ async def grade_in_sandbox(
         if grading.spec is not None and task.answer_type in CONVERSATION_ANSWERS:
             require_submission_compatibility(task)
             assert answer_file is not None
-            submissions.append(StagedFile(answer_file, _verifyit_answer_bytes(answer_submission(task, attempt))))
+            submission = answer_submission(task, attempt)
+            terminal = terminal_grade(grading.spec, submission)
+            if terminal is not None:
+                return terminal
+            submissions.append(StagedFile(answer_file, _verifyit_answer_bytes(submission)))
         elif isinstance(grading.grader, ScriptGrader) and grading.grader.answer_path is not None:
             answer = _script_answer_bytes(answer_submission(task, attempt))
             submissions.append(StagedFile(grading.grader.answer_path, answer))
@@ -538,6 +544,10 @@ async def _grade_staged(
                     machine_spec,
                     host_environment,
                 )
+                # The grading machine starts in the grader's workspace unless its environment names a
+                # directory; the spec's own workdir is the task machine's, or empty for an image machine.
+                if grading.environment.working_directory is None:
+                    prepared = replace(prepared, workdir=grading.workspace)
                 if attempt.stop_reason is not None:
                     prepared = replace(prepared, env={**prepared.env, "TASKCOMPENDIUM_STOP_REASON": attempt.stop_reason})
                 machine = await factory.create(prepared)
