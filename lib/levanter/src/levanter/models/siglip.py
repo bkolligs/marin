@@ -713,16 +713,6 @@ class SiglipVisionTransformer(ModuleWithStateDictSerialization):
 
     @staticmethod
     def init(config: SiglipVisionConfig, *, key: PRNGKeyArray) -> "SiglipVisionTransformer":
-        """
-        Initialize SiglipVisionTransformer.
-
-        Args:
-            config: SiglipVisionConfig
-            key: PRNGKey for initialization
-
-        Returns:
-            Initialized SiglipVisionTransformer module
-        """
         k_embed, k_layers = maybe_rng_split(key, 2)
 
         embeddings = SiglipVisionEmbeddings.init(config, key=k_embed)
@@ -791,16 +781,6 @@ class SiglipVisionModel(ModuleWithStateDictSerialization, VisionModelWithHfSeria
 
     @classmethod
     def init(cls, config: SiglipVisionConfig, *, key: PRNGKeyArray) -> "SiglipVisionModel":
-        """
-        Initialize SiglipVisionModel.
-
-        Args:
-            config: SiglipVisionConfig
-            key: PRNGKey for initialization
-
-        Returns:
-            Initialized SiglipVisionModel
-        """
         key_vision, key_head = maybe_rng_split(key, 2)
         vision_model = SiglipVisionTransformer.init(config, key=key_vision)
         head = SiglipMultiheadAttentionPoolingHead.init(config, key=key_head) if config.vision_use_head else None
