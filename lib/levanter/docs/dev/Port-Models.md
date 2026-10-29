@@ -117,6 +117,16 @@ Vision encoders use `HfVisionCheckpointConverter` and
 Pass vision checkpoint references as `RepoRef(model_name_or_path, revision=None)`.
 Both converters share checkpoint I/O and shard export through `HfCheckpointIO`.
 
+For example, load and export a local SigLIP checkpoint with:
+
+```python
+from levanter.models.siglip import SiglipVisionConfig, SiglipVisionModel
+
+converter = SiglipVisionConfig().hf_checkpoint_converter("/path/to/checkpoint")
+model = converter.load_pretrained(SiglipVisionModel)
+converter.save_pretrained(model, "/path/to/export", save_reference_code=False)
+```
+
 ### Serialization to/from State Dicts
 
 PyTorch and Hugging Face Transformers use "state dicts" as their preferred serialization format, either as pickles or as the new [safetensors](https://github.com/huggingface/safetensors) format.
