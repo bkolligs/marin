@@ -7,6 +7,7 @@ import equinox as eqx
 import haliax as hax
 import jax
 import jax.numpy as jnp
+import jmp
 import numpy as np
 import pytest
 from levanter.layers.attention import AttentionBackend
@@ -100,6 +101,15 @@ def test_image_conditioning_and_causal_text_prefix(config, batch):
     np.testing.assert_allclose(
         compute_loss(model, original_prefix), compute_loss(model, changed_padding), rtol=1e-5, atol=1e-5
     )
+
+
+def test_bfloat16_model_accepts_float32_images(config, batch):
+    model = Vlm.init(config, key=jax.random.PRNGKey(0))
+    model = jmp.get_policy("p=f32,c=bf16,o=f32").cast_to_compute(model)
+    forward = eqx.filter_jit(lambda pixels: model(batch.input_ids, pixels).array)
+    actual = forward(batch.pixel_values)
+    expected = forward(batch.pixel_values.astype(jnp.bfloat16))
+    np.testing.assert_array_equal(np.asarray(actual, dtype=np.float32), np.asarray(expected, dtype=np.float32))
 
 
 def test_caption_processing_aligns_bos_eos_truncation_and_padding():

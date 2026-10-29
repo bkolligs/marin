@@ -52,6 +52,7 @@ class Vlm(eqx.Module):
         if prefix_length + text_position.size > self.config.text.max_seq_len:
             raise ValueError("Image patches plus text exceed the language model context length")
         vision_key, text_key = (None, None) if key is None else jax.random.split(key)
+        pixel_values = pixel_values.astype(self.vision.vision_model.embeddings.patch_embedding.weight.dtype)
         features = self.vision(pixel_values, key=vision_key).last_hidden_state
         features = features.rename({"embed": "vision_embed", "num_patches": "position"})
         prefix = self.projector(features)
