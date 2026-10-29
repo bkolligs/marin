@@ -18,6 +18,7 @@ from levanter.data.image import ImageDatasetSourceConfig, load_image
 from levanter.models.loss import fused_cross_entropy_loss_and_logsumexp_penalty
 from levanter.optim.config import AdamConfig
 from levanter.trainer import Trainer, TrainerConfig
+from levanter.utils.tree_utils import inference_mode
 from transformers import PreTrainedTokenizerBase, SiglipImageProcessor
 
 from experiments.multimodality.base.model import Vlm, VlmConfig, load_pretrained
@@ -130,7 +131,9 @@ def train(config: TrainConfig, tokenizer: PreTrainedTokenizerBase, image_process
         model_key, training_key = jax.random.split(jax.random.PRNGKey(config.trainer.seed))
         _, restore = trainer.checkpoint_load_plan()
         if restore:
-            state = trainer.initial_state(training_key, model_init=lambda: Vlm.init(config.model, key=model_key))
+            state = trainer.initial_state(
+                training_key, model_init=lambda: inference_mode(Vlm.init(config.model, key=model_key), False)
+            )
         else:
             model = load_pretrained(
                 config.model,
@@ -139,6 +142,7 @@ def train(config: TrainConfig, tokenizer: PreTrainedTokenizerBase, image_process
                 key=model_key,
                 axis_mapping=trainer.parameter_axis_mapping,
             )
+            model = inference_mode(model, False)
             model = hax.shard(trainer.mp.cast_to_param(model), trainer.parameter_axis_mapping)
             state = trainer.initial_state(training_key, model=model)
         batches = islice(training_batches(config, tokenizer, image_processor), int(state.step), None)

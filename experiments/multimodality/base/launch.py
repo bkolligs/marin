@@ -31,7 +31,8 @@ def model_config(vision_checkpoint: str, text_checkpoint: str) -> VlmConfig:
     text = AutoConfig.from_pretrained(text_ref.model_name_or_path, revision=text_ref.revision)
     if text.model_type != "qwen3":
         raise ValueError("The base template requires a Qwen3 language checkpoint")
-    return VlmConfig(SiglipVisionConfig.from_hf_config(vision), Qwen3Config.from_hf_config(text), text.vocab_size)
+    vision_config = dataclasses.replace(SiglipVisionConfig.from_hf_config(vision), vision_use_head=False)
+    return VlmConfig(vision_config, Qwen3Config.from_hf_config(text), text.vocab_size)
 
 
 def main() -> None:

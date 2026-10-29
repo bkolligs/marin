@@ -7,6 +7,7 @@ The launcher pins both Hugging Face checkpoint revisions. Its default vision
 checkpoint is `google/siglip-so400m-patch14-384`.
 
 A single image is resized to 384×384 and encoded into 729 SigLIP patch features.
+The VLM omits SigLIP's pooled contrastive head and uses the patch features directly.
 A learned linear projection maps each feature to Delphi's 1536-dimensional
 embedding space. These features precede the caption tokens in Delphi's causal
 transformer. Training predicts caption tokens and EOS from BOS and preceding
