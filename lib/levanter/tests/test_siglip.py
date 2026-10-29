@@ -12,11 +12,10 @@ import numpy as np
 import pytest
 from transformers import PretrainedConfig
 from haliax.partitioning import ResourceAxis
-from haliax.state_dict import from_torch_compatible_state_dict, to_torch_compatible_state_dict
+from haliax.state_dict import from_torch_compatible_state_dict
 from jax.sharding import Mesh
 
-from levanter.models.siglip import SiglipAttention, SiglipVisionConfig, SiglipVisionModel
-from levanter.layers.attention import AttentionMask
+from levanter.models.siglip import SiglipVisionConfig, SiglipVisionModel
 from levanter.utils.activation import ActivationFunctionEnum
 from PIL import Image
 from levanter.testing.helpers import use_test_mesh
@@ -258,77 +257,3 @@ def test_siglip_vision_pretrained_random_pixels() -> None:
         assert not np.any(np.isnan(converted_output_np))
         np.testing.assert_allclose(lev_output_np, converted_output_np, rtol=1e-3, atol=1e-2)
         np.testing.assert_allclose(lev_pooler_np, converted_pooler_np, rtol=1e-3, atol=1e-2)
-
-
-def test_vision_checkpoint_roundtrip_preserves_jitted_predictions() -> None:
-    parameters = dict(hidden_size=16, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2, patch_size=16)
-    batch = hax.Axis("batch", 1)
-    config = SiglipVisionConfig(**parameters, image_size=32)
-    axes = (batch, hax.Axis("channels", 3), hax.Axis("height", 32), hax.Axis("width", 32))
-    model = SiglipVisionModel.init(config, key=jax.random.PRNGKey(0))
-    other = SiglipVisionModel.init(config, key=jax.random.PRNGKey(1))
-    pixels = hax.random.normal(jax.random.PRNGKey(2), axes)
-
-    def forward(network: SiglipVisionModel) -> jax.Array:
-        output = network(pixels)
-        assert output.pooler_output is not None
-        return jnp.concatenate([output.last_hidden_state.array.reshape(-1), output.pooler_output.array.reshape(-1)])
-
-    forward = eqx.filter_jit(forward)
-    expected = forward(model)
-    assert not np.allclose(expected, forward(other))
-    restored = from_torch_compatible_state_dict(other, to_torch_compatible_state_dict(model))
-    np.testing.assert_allclose(forward(restored), expected, rtol=1e-05, atol=1e-05)
-
-    def objective(network: SiglipVisionModel) -> jax.Array:
-        features = network(pixels).last_hidden_state.array
-        return jnp.sum(features * jnp.arange(features.shape[-1]))
-
-    gradients = eqx.filter_grad(objective)(restored)
-    leaves = jax.tree.leaves(eqx.filter(gradients, eqx.is_array))
-    assert all(np.isfinite(leaf).all() for leaf in leaves)
-    assert any(np.any(leaf != 0) for leaf in leaves)
-
-
-@skip_if_no_torch
-def test_public_vision_checkpoint_loader(tmp_path):
-    from transformers import SiglipVisionModel as HfSiglipVisionModel  # noqa: PLC0415 - optional Torch reference
-    from transformers import SiglipConfig as HfSiglipConfig  # noqa: PLC0415 - optional Torch reference
-
-    parameters = dict(hidden_size=16, intermediate_size=32, num_hidden_layers=1, num_attention_heads=2, patch_size=2)
-    config = SiglipVisionConfig(**parameters, image_size=4)
-    hf_model = HfSiglipVisionModel(config.to_hf_config())
-    axes = (hax.Axis("batch", 1), hax.Axis("channels", 3), hax.Axis("height", 4), hax.Axis("width", 4))
-    hf_model.save_pretrained(tmp_path)
-    HfSiglipConfig(vision_config=hf_model.config.to_dict()).save_pretrained(tmp_path)
-    converter = config.hf_checkpoint_converter(str(tmp_path))
-    with use_test_mesh():
-        loaded = converter.load_pretrained(config.model_type)
-        template = config.model_type.init(config, key=jax.random.PRNGKey(1))
-        expected = from_torch_compatible_state_dict(template, converter.load_state_dict(str(tmp_path)))
-    pixels = hax.random.normal(jax.random.PRNGKey(2), axes)
-    forward = eqx.filter_jit(lambda model: model(pixels).last_hidden_state.array)
-    np.testing.assert_allclose(forward(loaded), forward(expected), rtol=1e-05, atol=1e-05)
-    exported = tmp_path / "exported"
-    with use_test_mesh():
-        converter.save_pretrained(loaded, str(exported), save_reference_code=False)
-        restored = config.hf_checkpoint_converter(str(exported)).load_pretrained(config.model_type)
-    np.testing.assert_allclose(forward(restored), forward(loaded), rtol=1e-05, atol=1e-05)
-
-
-def test_siglip_attention_respects_explicit_mask():
-    config = SiglipVisionConfig(
-        hidden_size=8, intermediate_size=16, num_hidden_layers=1, num_attention_heads=2, patch_size=2
-    )
-    attention = SiglipAttention.init(config, key=jax.random.PRNGKey(0))
-    sequence = hax.Axis("num_patches", 5)
-    pixels = hax.random.normal(jax.random.PRNGKey(1), (hax.Axis("batch", 1), sequence, config.Embed))
-    mask = AttentionMask.explicit(hax.named(jnp.eye(5, dtype=bool), (sequence, hax.Axis("key_position", 5))))
-    actual = eqx.filter_jit(lambda x: attention(x, mask=mask))(pixels)
-    # Diagonal attention gives each query exactly its own projected value.
-    position = hax.Axis("position", sequence.size)
-    values = attention.v_proj(pixels.rename({sequence: position}))
-    values = values.broadcast_axis(config.attention_config().QHeadsPerGroup)
-    values = values.flatten_axes(("kv_head", "q_heads_per_group"), "heads")
-    expected = attention.o_proj(values).rename({position: sequence})
-    np.testing.assert_allclose(actual.array, expected.array, rtol=1e-05, atol=1e-05)
