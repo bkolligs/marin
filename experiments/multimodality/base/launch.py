@@ -11,36 +11,21 @@ import jmp
 from levanter.checkpoint import CheckpointerConfig
 from levanter.compat.hf_checkpoints import RepoRef
 from levanter.data.image import ImageDatasetSourceConfig
-from levanter.models.qwen import Qwen3Config
-from levanter.models.siglip import SiglipVisionConfig
 from levanter.optim.config import AdamConfig
 from levanter.tracker.tracker import NoopConfig
 from levanter.trainer import TrainerConfig
-from transformers import AutoConfig, AutoTokenizer, SiglipImageProcessor
+from transformers import AutoTokenizer, SiglipImageProcessor
 
 from experiments.multimodality.base.model import VlmConfig
 from experiments.multimodality.base.train import TrainConfig, train
-
-VISION_CHECKPOINT = "google/siglip-so400m-patch14-384@9fdffc58afc957d1a03a25b10dba0329ab15c2a3"
-TEXT_CHECKPOINT = "marin-community/delphi-3e19-998Mparams-5Btokens@1aa790e5d1e3402d4893e18b389f8bf007b8c267"
-
-
-def model_config(vision_checkpoint: str, text_checkpoint: str) -> VlmConfig:
-    vision_ref, text_ref = RepoRef.from_string(vision_checkpoint), RepoRef.from_string(text_checkpoint)
-    vision = AutoConfig.from_pretrained(vision_ref.model_name_or_path, revision=vision_ref.revision)
-    text = AutoConfig.from_pretrained(text_ref.model_name_or_path, revision=text_ref.revision)
-    if text.model_type != "qwen3":
-        raise ValueError("The base template requires a Qwen3 language checkpoint")
-    vision_config = dataclasses.replace(SiglipVisionConfig.from_hf_config(vision), vision_use_head=False)
-    return VlmConfig(vision_config, Qwen3Config.from_hf_config(text), text.vocab_size)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--train-data", required=True, nargs="+", help="Image-caption JSONL, JSON, or Parquet paths")
     parser.add_argument("--output-path", required=True)
-    parser.add_argument("--vision-checkpoint", default=VISION_CHECKPOINT)
-    parser.add_argument("--text-checkpoint", default=TEXT_CHECKPOINT)
+    parser.add_argument("--vision-checkpoint")
+    parser.add_argument("--text-checkpoint")
     parser.add_argument("--text-length", type=int, default=512)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -48,15 +33,13 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true", help="Resolve model configs without loading weights or data")
     args = parser.parse_args()
-    model = model_config(args.vision_checkpoint, args.text_checkpoint)
+    model = VlmConfig.from_checkpoints(args.vision_checkpoint, args.text_checkpoint)
     if args.text_length < 1 or args.text_length + model.vision.NumPatches.size > model.text.max_seq_len:
         raise ValueError("text_length must fit alongside the image prefix within the language model context")
     if args.steps < 1 or args.batch_size < 1:
         raise ValueError("steps and batch_size must be positive")
     config = TrainConfig(
         model=model,
-        vision_checkpoint=args.vision_checkpoint,
-        text_checkpoint=args.text_checkpoint,
         data=ImageDatasetSourceConfig(train_urls=args.train_data),
         text_length=args.text_length,
         trainer=TrainerConfig(
@@ -74,8 +57,8 @@ def main() -> None:
         print(
             json.dumps(
                 {
-                    "vision_checkpoint": config.vision_checkpoint,
-                    "text_checkpoint": config.text_checkpoint,
+                    "vision_checkpoint": config.model.vision_checkpoint,
+                    "text_checkpoint": config.model.text_checkpoint,
                     "vision": dataclasses.asdict(model.vision),
                     "text": dataclasses.asdict(model.text),
                     "vocab_size": model.vocab_size,
@@ -93,7 +76,9 @@ def main() -> None:
             )
         )
         return
-    vision_ref, text_ref = RepoRef.from_string(config.vision_checkpoint), RepoRef.from_string(config.text_checkpoint)
+    vision_ref, text_ref = RepoRef.from_string(config.model.vision_checkpoint), RepoRef.from_string(
+        config.model.text_checkpoint
+    )
     tokenizer = AutoTokenizer.from_pretrained(text_ref.model_name_or_path, revision=text_ref.revision)
     processor = SiglipImageProcessor.from_pretrained(vision_ref.model_name_or_path, revision=vision_ref.revision)
     train(config, tokenizer, processor)

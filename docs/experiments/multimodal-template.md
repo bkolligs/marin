@@ -3,7 +3,8 @@
 `experiments/multimodality/base/` trains an image-caption VLM using the
 [SigLIP encoder from PR #10076](https://github.com/marin-community/marin/pull/10076)
 and [Delphi 998M](https://huggingface.co/marin-community/delphi-3e19-998Mparams-5Btokens).
-The launcher pins both Hugging Face checkpoint revisions. Its default vision
+`VlmConfig` owns both pinned Hugging Face checkpoint paths.
+`VlmConfig.from_checkpoints()` resolves their model dimensions; its default vision
 checkpoint is `google/siglip-so400m-patch14-384`.
 
 A single image is resized to 384×384 and encoded into 729 SigLIP patch features.

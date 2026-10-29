@@ -36,6 +36,7 @@ def config():
             patch_size=2,
             attn_backend=AttentionBackend.VANILLA,
             use_flash_attention=False,
+            vision_use_head=False,
         ),
         Qwen3Config(
             hidden_dim=8,
@@ -142,8 +143,9 @@ def test_local_pretrained_backbones_and_model_roundtrip(config, batch, tmp_path)
     # The LM converter reads tokenizer metadata to establish its vocabulary axis.
     backend = Tokenizer(WordLevel({str(i): i for i in range(config.vocab_size)}, unk_token="0"))
     PreTrainedTokenizerFast(tokenizer_object=backend).save_pretrained(text_path)
+    config = VlmConfig.from_checkpoints(str(vision_path), str(text_path))
     with use_test_mesh():
-        loaded = load_pretrained(config, str(vision_path), str(text_path), key=jax.random.PRNGKey(3))
+        loaded = load_pretrained(config, key=jax.random.PRNGKey(3))
     for original, restored in ((model.vision, loaded.vision), (model.language, loaded.language)):
         for expected, actual in zip(jax.tree.leaves(original), jax.tree.leaves(restored), strict=True):
             np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-5)

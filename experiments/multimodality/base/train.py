@@ -34,8 +34,6 @@ class CaptionBatch(eqx.Module):
 @dataclass(frozen=True)
 class TrainConfig:
     model: VlmConfig
-    vision_checkpoint: str
-    text_checkpoint: str
     data: ImageDatasetSourceConfig
     text_length: int
     trainer: TrainerConfig
@@ -137,8 +135,6 @@ def train(config: TrainConfig, tokenizer: PreTrainedTokenizerBase, image_process
         else:
             model = load_pretrained(
                 config.model,
-                config.vision_checkpoint,
-                config.text_checkpoint,
                 key=model_key,
                 axis_mapping=trainer.parameter_axis_mapping,
             )

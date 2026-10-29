@@ -3,7 +3,7 @@
 
 """SigLIP image prefixes conditioned into a Delphi (Qwen3) language model."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
 import equinox as eqx
@@ -13,9 +13,11 @@ import jax
 from haliax import Axis, NamedArray
 from haliax.partitioning import ResourceMapping
 from jaxtyping import PRNGKeyArray
+from levanter.compat.hf_checkpoints import RepoRef
 from levanter.layers.attention import AttentionMask
 from levanter.models.qwen import Qwen3Config, Qwen3LMHeadModel
 from levanter.models.siglip import SiglipVisionConfig, SiglipVisionModel
+from transformers import AutoConfig
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,26 @@ class VlmConfig:
     vision: SiglipVisionConfig
     text: Qwen3Config
     vocab_size: int
+    vision_checkpoint: str = "google/siglip-so400m-patch14-384@9fdffc58afc957d1a03a25b10dba0329ab15c2a3"
+    text_checkpoint: str = "marin-community/delphi-3e19-998Mparams-5Btokens@1aa790e5d1e3402d4893e18b389f8bf007b8c267"
+
+    @classmethod
+    def from_checkpoints(cls, vision_checkpoint: str | None = None, text_checkpoint: str | None = None) -> "VlmConfig":
+        """Resolve backbone dimensions from checkpoint metadata, using the pinned defaults."""
+        vision_checkpoint = cls.vision_checkpoint if vision_checkpoint is None else vision_checkpoint
+        text_checkpoint = cls.text_checkpoint if text_checkpoint is None else text_checkpoint
+        vision_ref, text_ref = RepoRef.from_string(vision_checkpoint), RepoRef.from_string(text_checkpoint)
+        vision = AutoConfig.from_pretrained(vision_ref.model_name_or_path, revision=vision_ref.revision)
+        text = AutoConfig.from_pretrained(text_ref.model_name_or_path, revision=text_ref.revision)
+        if text.model_type != "qwen3":
+            raise ValueError("The base template requires a Qwen3 language checkpoint")
+        return cls(
+            vision=replace(SiglipVisionConfig.from_hf_config(vision), vision_use_head=False),
+            text=Qwen3Config.from_hf_config(text),
+            vocab_size=text.vocab_size,
+            vision_checkpoint=vision_checkpoint,
+            text_checkpoint=text_checkpoint,
+        )
 
     @property
     def VisionEmbed(self) -> Axis:
@@ -68,17 +90,15 @@ class Vlm(eqx.Module):
 
 def load_pretrained(
     config: VlmConfig,
-    vision_checkpoint: str,
-    text_checkpoint: str,
     *,
     key: PRNGKeyArray,
     axis_mapping: ResourceMapping | None = None,
 ) -> Vlm:
     """Load both backbones and initialize only the image projection from scratch."""
-    vision = config.vision.hf_checkpoint_converter(vision_checkpoint).load_pretrained(
+    vision = config.vision.hf_checkpoint_converter(config.vision_checkpoint).load_pretrained(
         SiglipVisionModel, config=config.vision, axis_mapping=axis_mapping
     )
-    language = config.text.hf_checkpoint_converter(text_checkpoint).load_pretrained(
+    language = config.text.hf_checkpoint_converter(config.text_checkpoint).load_pretrained(
         Qwen3LMHeadModel, config=config.text, axis_mapping=axis_mapping
     )
     projector = hnn.Linear.init(config.VisionEmbed, config.text.Embed, key=key, use_bias=True)
