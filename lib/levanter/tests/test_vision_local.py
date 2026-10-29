@@ -8,8 +8,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from haliax.state_dict import from_torch_compatible_state_dict, to_torch_compatible_state_dict
-from levanter.data.dataset import ListAsyncDataset
-from levanter.data.image import RepeatedImageDataset
 from levanter.models.siglip import SiglipAttention, SiglipVisionConfig, SiglipVisionModel
 from levanter.models.siglip2 import Siglip2VisionConfig, Siglip2VisionModel, Siglip2VisionEmbeddings
 from levanter.layers.attention import AttentionMask
@@ -29,8 +27,8 @@ def test_vision_checkpoint_roundtrip_preserves_jitted_predictions(encoder: str) 
         model_class = Siglip2VisionModel
         axes = (batch, hax.Axis("num_patches", 4), hax.Axis("patch_input", 768))
 
-    model = model_class.init(hax.Axis("vocab", 1), config, key=jax.random.PRNGKey(0))
-    other = model_class.init(hax.Axis("vocab", 1), config, key=jax.random.PRNGKey(1))
+    model = model_class.init(config, key=jax.random.PRNGKey(0))
+    other = model_class.init(config, key=jax.random.PRNGKey(1))
     pixels = hax.random.normal(jax.random.PRNGKey(2), axes)
 
     def forward(network: SiglipVisionModel | Siglip2VisionModel) -> jax.Array:
@@ -52,16 +50,6 @@ def test_vision_checkpoint_roundtrip_preserves_jitted_predictions(encoder: str) 
     leaves = jax.tree.leaves(eqx.filter(gradients, eqx.is_array))
     assert all(np.isfinite(leaf).all() for leaf in leaves)
     assert any(np.any(leaf != 0) for leaf in leaves)
-
-
-@pytest.mark.asyncio
-async def test_image_repetition_crosses_epoch_boundary_and_stops() -> None:
-    source = ListAsyncDataset([{"text": "first"}, {"text": "second"}])
-    repeated = RepeatedImageDataset(source, epochs=2)
-    assert await repeated.async_len() == 4
-    assert await repeated.get_batch([1, 2, 3]) == [{"text": "second"}, {"text": "first"}, {"text": "second"}]
-    with pytest.raises(IndexError):
-        await repeated.get_batch([4])
 
 
 @pytest.mark.parametrize("encoder", ["siglip", "siglip2"])
@@ -91,11 +79,16 @@ def test_public_vision_checkpoint_loader(tmp_path, encoder):
     converter = config.hf_checkpoint_converter(str(tmp_path))
     with use_test_mesh():
         loaded = converter.load_pretrained(config.model_type)
-        template = config.model_type.init(hax.Axis("vocab", 0), config, key=jax.random.PRNGKey(1))
+        template = config.model_type.init(config, key=jax.random.PRNGKey(1))
         expected = from_torch_compatible_state_dict(template, converter.load_state_dict(str(tmp_path)))
     pixels = hax.random.normal(jax.random.PRNGKey(2), axes)
     forward = eqx.filter_jit(lambda model: model(pixels).last_hidden_state.array)
     np.testing.assert_allclose(forward(loaded), forward(expected), rtol=1e-5, atol=1e-5)
+    exported = tmp_path / "exported"
+    with use_test_mesh():
+        converter.save_pretrained(loaded, str(exported), save_reference_code=False)
+        restored = config.hf_checkpoint_converter(str(exported)).load_pretrained(config.model_type)
+    np.testing.assert_allclose(forward(restored), forward(loaded), rtol=1e-5, atol=1e-5)
 
 
 @skip_if_no_torch

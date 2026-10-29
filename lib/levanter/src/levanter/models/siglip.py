@@ -35,7 +35,11 @@ from haliax.state_dict import (  # noqa: E402
     with_prefix,
 )
 
-from levanter.compat.hf_checkpoints import HFCheckpointConverter, ModelWithHfSerializationMixin  # noqa: E402
+from levanter.compat.hf_checkpoints import (  # noqa: E402
+    HfVisionCheckpointConverter,
+    RepoRef,
+    VisionModelWithHfSerializationMixin,
+)
 from levanter.layers.attention import (  # noqa: E402
     Attention,
     AttentionBackend,
@@ -120,11 +124,12 @@ class SiglipVisionConfig(VisionEncoderConfig["SiglipVisionModel"]):
 
     def hf_checkpoint_converter(
         self, ref_checkpoint: Optional[str] = None
-    ) -> HFCheckpointConverter["SiglipVisionConfig"]:  # type: ignore
+    ) -> HfVisionCheckpointConverter["SiglipVisionConfig"]:
         """Create HuggingFace checkpoint converter for this config."""
-        return HFCheckpointConverter(
+        reference = self.reference_checkpoint if ref_checkpoint is None else ref_checkpoint
+        return HfVisionCheckpointConverter(
             self.__class__,
-            reference_checkpoint=self.reference_checkpoint if ref_checkpoint is None else ref_checkpoint,
+            reference_checkpoint=RepoRef.from_string(reference) if reference is not None else None,
             trust_remote_code=False,
             HfConfigClass=HfSiglipVisionConfig,
         )
@@ -160,11 +165,10 @@ class SiglipVisionConfig(VisionEncoderConfig["SiglipVisionModel"]):
             vision_use_head=getattr(hf_config, "vision_use_head", True),
         )
 
-    def to_hf_config(self, vocab_size: int = 1, config_overrides: Optional[Dict] = None) -> HfSiglipVisionConfig:
+    def to_hf_config(self, config_overrides: Optional[Dict] = None) -> HfSiglipVisionConfig:
         """Convert from Levanter config to HuggingFace config.
 
         Args:
-            vocab_size: Vocabulary size (unused for vision-only models, but required by interface)
             config_overrides: Optional config overrides
         """
         if config_overrides is None:
@@ -274,6 +278,9 @@ class SiglipBlockConfig(Protocol):
 
     @property
     def Layers(self) -> Axis: ...
+
+    @property
+    def gradient_checkpointing(self) -> bool: ...
 
     @property
     def hidden_act(self) -> ActivationFunctionEnum: ...
@@ -421,6 +428,14 @@ class SiglipEncoderLayer(eqx.Module):
         key_attention, _ = maybe_rng_split(key, 2)
         x = x + self.self_attn(self.layer_norm1(x), mask=mask, key=key_attention)
         return x + self.mlp(self.layer_norm2(x))
+
+
+def siglip_encoder_layers(config: SiglipBlockConfig, *, key: PRNGKeyArray) -> Stacked[SiglipEncoderLayer]:
+    return Stacked.init(
+        config.Layers,
+        SiglipEncoderLayer,
+        gradient_checkpointing=config.gradient_checkpointing,
+    )(config, key=shaped_rng_split(key, config.Layers.size))
 
 
 def siglip_hidden_states(
@@ -694,29 +709,15 @@ class SiglipVisionTransformer(ModuleWithStateDictSerialization):
 
     def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
         """Map Levanter field names to HuggingFace state dict keys."""
-        return {"layers": "encoder.layers"}  # HF uses encoder.layers instead of layers
+        return {"layers": "encoder.layers"}
 
     @staticmethod
     def init(config: SiglipVisionConfig, *, key: PRNGKeyArray) -> "SiglipVisionTransformer":
-        """
-        Initialize SiglipVisionTransformer.
-
-        Args:
-            config: SiglipVisionConfig
-            key: PRNGKey for initialization
-
-        Returns:
-            Initialized SiglipVisionTransformer module
-        """
         k_embed, k_layers = maybe_rng_split(key, 2)
 
         embeddings = SiglipVisionEmbeddings.init(config, key=k_embed)
 
-        layers = Stacked.init(
-            config.Layers,
-            SiglipEncoderLayer,
-            gradient_checkpointing=config.gradient_checkpointing,
-        )(config, key=shaped_rng_split(k_layers, config.num_hidden_layers))
+        layers = siglip_encoder_layers(config, key=k_layers)
 
         post_layernorm = hnn.LayerNorm.init(config.Embed, eps=config.layer_norm_eps, use_bias=True)
 
@@ -759,12 +760,12 @@ class SiglipVisionTransformer(ModuleWithStateDictSerialization):
         return SiglipVisionModelOutput(last_hidden_state=last_hidden_state, hidden_states=result_hidden_states)
 
 
-class SiglipVisionModel(ModuleWithStateDictSerialization, ModelWithHfSerializationMixin[SiglipVisionConfig]):
+class SiglipVisionModel(ModuleWithStateDictSerialization, VisionModelWithHfSerializationMixin[SiglipVisionConfig]):
     """
     SigLIP Vision Model with HuggingFace compatibility.
 
     This is a wrapper around SiglipVisionTransformer that implements
-    the ModelWithHfSerializationMixin interface for checkpoint conversion.
+    vision checkpoint conversion.
     """
 
     vision_model: SiglipVisionTransformer
@@ -774,29 +775,12 @@ class SiglipVisionModel(ModuleWithStateDictSerialization, ModelWithHfSerializati
     def config(self) -> SiglipVisionConfig:
         return self.vision_model.config
 
-    @property
-    def Vocab(self) -> Axis:
-        # Vision models don't have a vocab, but ModelWithHfSerializationMixin requires it
-        # We use a dummy axis for compatibility
-        return Axis(name="vocab", size=1)
-
     def get_hf_config(self) -> HfConfig:
         """Return the Hugging Face vision configuration."""
         return self.config.to_hf_config()
 
     @classmethod
-    def init(cls, Vocab: Axis, config: SiglipVisionConfig, *, key: PRNGKeyArray) -> "SiglipVisionModel":
-        """
-        Initialize SiglipVisionModel.
-
-        Args:
-            Vocab: Dummy vocab axis (not used for vision models, but required by interface)
-            config: SiglipVisionConfig
-            key: PRNGKey for initialization
-
-        Returns:
-            Initialized SiglipVisionModel
-        """
+    def init(cls, config: SiglipVisionConfig, *, key: PRNGKeyArray) -> "SiglipVisionModel":
         key_vision, key_head = maybe_rng_split(key, 2)
         vision_model = SiglipVisionTransformer.init(config, key=key_vision)
         head = SiglipMultiheadAttentionPoolingHead.init(config, key=key_head) if config.vision_use_head else None

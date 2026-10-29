@@ -1,7 +1,7 @@
 # SigLIP–Delphi multimodal template
 
 `experiments/multimodality/base/` trains an image-caption VLM using the
-[SigLIP encoder from PR #10076](https://github.com/marin-community/marin/pull/10076)
+[SigLIP encoder](https://github.com/bkolligs/marin/pull/6)
 and [Delphi 998M](https://huggingface.co/marin-community/delphi-3e19-998Mparams-5Btokens).
 `VlmConfig` owns both pinned Hugging Face checkpoint paths.
 `VlmConfig.from_checkpoints()` resolves their model dimensions; its default vision

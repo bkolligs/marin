@@ -62,7 +62,7 @@ class Vlm(eqx.Module):
         vision_key, projector_key, text_key = jax.random.split(key, 3)
         return cls(
             config,
-            SiglipVisionModel.init(Axis("vocab", 0), config.vision, key=vision_key),
+            SiglipVisionModel.init(config.vision, key=vision_key),
             hnn.Linear.init(config.VisionEmbed, config.text.Embed, key=projector_key, use_bias=True),
             Qwen3LMHeadModel.init(Axis("vocab", config.vocab_size), config.text, key=text_key),
         )
