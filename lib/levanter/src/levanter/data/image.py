@@ -36,7 +36,7 @@ from levanter.data.dataset import MappedAsyncDataset
 from levanter.data.sharded_datasource import (
     ShardedDataSource,
     UrlBackedShardedDataSource,
-    WrappedHFDataSource,
+    datasource_from_hf_or_none,
     _iter_parquet_from_row,
     _sniff_format_for_dataset,
 )
@@ -59,9 +59,27 @@ from rigging.filesystem.storage_path import StoragePath, prefix_join  # noqa: E4
 
 logger = logging.getLogger("levanter.data.image")
 
-DEFAULT_IMAGE_TILE_SIZE = 384
-DEFAULT_IMAGE_TEXT_MAX_LENGTH = 2048
 PREFETCH_WAIT_TIMEOUT = 0.05
+
+
+ConversationMessage = TypedDict(
+    "ConversationMessage",
+    {
+        "role": str,  # "user", "assistant", "system"
+        "content": List[Dict[str, Any]],  # [{"type": "image"}, {"type": "text", "text": "..."}]
+    },
+)
+
+ConversationDict = TypedDict(
+    "ConversationDict",
+    {
+        "messages": List[ConversationMessage],
+        "images": list[Any],
+        "audio": list[Any],
+        "videos": list[Any],
+    },
+    total=False,
+)
 
 
 class ImageTextUrlDataSource(UrlBackedShardedDataSource[dict]):
@@ -118,7 +136,7 @@ class ImageTextUrlDataSource(UrlBackedShardedDataSource[dict]):
                         raise ValueError(f"Unknown format {format}")
 
 
-class ImageConversationUrlDataSource(UrlBackedShardedDataSource[dict]):
+class ImageConversationUrlDataSource(UrlBackedShardedDataSource[ConversationDict]):
     """
     Dataset for conversation-format image-text data (VLM training format).
 
@@ -140,7 +158,7 @@ class ImageConversationUrlDataSource(UrlBackedShardedDataSource[dict]):
         self.messages_key = messages_key
         self.images_key = images_key
 
-    def open_shard_at_row(self, shard_name: str, row: int) -> Iterator[dict]:
+    def open_shard_at_row(self, shard_name: str, row: int) -> Iterator[ConversationDict]:
         url = self._shard_name_to_url_mapping[shard_name]
         i = 0
         format = _sniff_format_for_dataset(url)
@@ -154,12 +172,7 @@ class ImageConversationUrlDataSource(UrlBackedShardedDataSource[dict]):
                 ]
                 columns = [self.messages_key, *optional_columns]
                 for record in _iter_parquet_from_row(parquet_file, row, columns=columns):
-                    yield {
-                        "messages": record[self.messages_key],
-                        "images": record.get(self.images_key, []),
-                        "audio": record.get("audio", []),
-                        "videos": record.get("videos", []),
-                    }
+                    yield conversation_fields(record, self.messages_key, self.images_key)
         else:
             with StoragePath(url).open("r", compression="infer") as f:
                 match format:
@@ -167,22 +180,12 @@ class ImageConversationUrlDataSource(UrlBackedShardedDataSource[dict]):
                         for line in f:
                             if i >= row:
                                 data = json.loads(line)
-                                yield {
-                                    "messages": data[self.messages_key],
-                                    "images": data.get(self.images_key, []),
-                                    "audio": data.get("audio", []),
-                                    "videos": data.get("videos", []),
-                                }
+                                yield conversation_fields(data, self.messages_key, self.images_key)
                             i += 1
                     case ".json":
                         data = json.load(f)
                         for doc in data[row:]:
-                            yield {
-                                "messages": doc[self.messages_key],
-                                "images": doc.get(self.images_key, []),
-                                "audio": doc.get("audio", []),
-                                "videos": doc.get("videos", []),
-                            }
+                            yield conversation_fields(doc, self.messages_key, self.images_key)
                     case _:
                         raise ValueError(f"Unknown format {format}")
 
@@ -232,24 +235,14 @@ def image_source_urls(urls: Sequence[str]) -> list[str]:
     return sorted(result)
 
 
-ConversationMessage = TypedDict(
-    "ConversationMessage",
-    {
-        "role": str,  # "user", "assistant", "system"
-        "content": List[Dict[str, Any]],  # [{"type": "image"}, {"type": "text", "text": "..."}]
-    },
-)
-
-ConversationDict = TypedDict(
-    "ConversationDict",
-    {
-        "messages": List[ConversationMessage],
-        "images": list[Any],
-        "audio": list[Any],
-        "videos": list[Any],
-    },
-    total=False,
-)
+def conversation_fields(record: Mapping[str, Any], messages_key: str, images_key: str) -> ConversationDict:
+    """Normalize source field names and retain optional modality references."""
+    return {
+        "messages": record[messages_key],
+        "images": record.get(images_key, []),
+        "audio": record.get("audio", []),
+        "videos": record.get("videos", []),
+    }
 
 
 # Pixel values are optional to support text-only examples.
@@ -275,10 +268,10 @@ class ImageTextDict(TypedDict, total=False):
     unpad_indices: np.ndarray | None
 
 
-def _image_text_cache_exemplar(patch_size: int) -> ImageTextDict:
+def _image_text_cache_exemplar(tile_size: int) -> ImageTextDict:
     """Build the array schema TreeCache uses for processed image examples."""
     return {
-        "pixel_values": np.zeros((1, 3, patch_size, patch_size), dtype=np.float32),
+        "pixel_values": np.zeros((1, 3, tile_size, tile_size), dtype=np.float32),
         "input_ids": np.zeros((1,), dtype=np.int32),
         "attention_mask": np.zeros((1,), dtype=np.int32),
         "image_sizes": np.zeros((1, 2), dtype=np.int32),
@@ -339,12 +332,12 @@ def load_image(image_data: Any) -> Image.Image:
 @dataclass(frozen=True)
 class AnyResolutionParams:
     grid_pinpoints: Optional[List[List[int]]]
-    patch_size: int
+    tile_size: int
     vision_feature_height: Optional[int]
     max_num_patches: Optional[int]
 
 
-class ImageProcessorCallable(Protocol):
+class MultimodalProcessorCallable(Protocol):
     def __call__(
         self,
         *,
@@ -359,19 +352,24 @@ class ImageProcessorCallable(Protocol):
 
 def _extract_anyres_params(processor: ProcessorMixin) -> AnyResolutionParams:
     """Read tiling parameters from the processor's image configuration."""
-    image_processor = getattr(processor, "image_processor", None)
-    if image_processor is None:
-        return AnyResolutionParams(None, DEFAULT_IMAGE_TILE_SIZE, None, None)
-
+    image_processor = processor.image_processor
     grid_pinpoints = getattr(image_processor, "image_grid_pinpoints", None)
-    size_dict = getattr(image_processor, "crop_size", None) or getattr(image_processor, "size", {})
-    patch_size = (
-        size_dict.get("height", size_dict.get("shortest_edge", DEFAULT_IMAGE_TILE_SIZE))
-        if isinstance(size_dict, dict)
-        else DEFAULT_IMAGE_TILE_SIZE
-    )
-    assert isinstance(patch_size, int)
-    vision_feature_height = patch_size // 14
+    size = getattr(image_processor, "crop_size", None) or image_processor.size
+    if not isinstance(size, int):
+        tile_size = size.get("height", size.get("shortest_edge"))
+        width = size.get("width", tile_size)
+        if width != tile_size:
+            raise ValueError("Image tiles must be square; configure a square crop in the image processor")
+    else:
+        tile_size = size
+    if not isinstance(tile_size, int):
+        raise ValueError("The image processor must specify a tile height or shortest_edge")
+    vision_feature_height = None
+    if grid_pinpoints:
+        encoder_patch_size = processor.patch_size
+        if not isinstance(encoder_patch_size, int):
+            raise ValueError("Any-resolution processing requires the encoder patch size")
+        vision_feature_height = tile_size // encoder_patch_size
     max_num_patches = None
 
     # Try to get max_num_patches from vision_aspect_ratio (LLaVA-specific)
@@ -379,16 +377,22 @@ def _extract_anyres_params(processor: ProcessorMixin) -> AnyResolutionParams:
     if vision_aspect_ratio and isinstance(vision_aspect_ratio, str) and "anyres_max_" in vision_aspect_ratio:
         max_num_patches = int(vision_aspect_ratio.split("anyres_max_")[-1])
 
-    # Fallback: compute from grid_pinpoints if available
     if max_num_patches is None and grid_pinpoints:
         max_resolution = max(max(h, w) for h, w in grid_pinpoints)
-        max_patches_per_dim = max_resolution // patch_size
+        max_patches_per_dim = max_resolution // tile_size
         max_num_patches = max_patches_per_dim * max_patches_per_dim  # +1 for base is added in _pad_pixel_values
 
-    return AnyResolutionParams(grid_pinpoints, patch_size, vision_feature_height, max_num_patches)
+    return AnyResolutionParams(grid_pinpoints, tile_size, vision_feature_height, max_num_patches)
 
 
-class BatchImageProcessor(BatchProcessor[Dict[str, Any], ImageTextDict]):
+def _pad_or_trim_image_tiles(pixel_values: np.ndarray, num_tiles: int) -> np.ndarray:
+    if pixel_values.shape[0] >= num_tiles:
+        return pixel_values[:num_tiles]
+    padding = np.zeros((num_tiles - pixel_values.shape[0],) + pixel_values.shape[1:], dtype=pixel_values.dtype)
+    return np.concatenate([pixel_values, padding], axis=0)
+
+
+class BatchMultimodalProcessor(BatchProcessor[ConversationDict, ImageTextDict]):
     """
     A batch processor that converts conversation-format data into model-ready inputs.
 
@@ -442,7 +446,8 @@ class BatchImageProcessor(BatchProcessor[Dict[str, Any], ImageTextDict]):
             # None if max_num_patches is not configured.
 
         "unpad_indices": np.ndarray or None,
-            # Shape: (num_image_tokens,) dtype: int32
+            # Shape: (max_features,) with a patch limit, otherwise (num_image_tokens,); dtype: int32.
+            # Entries after the unpadded feature count are zero padding.
             # Index mapping from HuggingFace's unpadded feature order to Levanter's padded order.
             # Used to reorder vision features after encoding to match HF's spatial unpadding.
             # Only computed for single-image anyres case; None otherwise.
@@ -456,19 +461,19 @@ class BatchImageProcessor(BatchProcessor[Dict[str, Any], ImageTextDict]):
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
         image_token: str | None = None,
         video_token: str | None = None,
-        max_length: int = DEFAULT_IMAGE_TEXT_MAX_LENGTH,
+        max_length: int,
         padding: bool = True,
         messages_key: str = "messages",
         images_key: str = "images",
         add_generation_prompt: bool = False,
         mask_prompt: bool = True,
-        max_num_patches: Optional[int] = 9,
+        max_num_patches: Optional[int] = None,
         grid_pinpoints: Optional[List[List[int]]] = None,
-        patch_size: int = DEFAULT_IMAGE_TILE_SIZE,
+        tile_size: Optional[int] = None,
         vision_feature_height: Optional[int] = None,
     ) -> None:
         """
-        Initialize the BatchImageProcessor.
+        Initialize the BatchMultimodalProcessor.
 
         Args:
             processor: HuggingFace processor (e.g., AutoProcessor.from_pretrained(...))
@@ -482,7 +487,7 @@ class BatchImageProcessor(BatchProcessor[Dict[str, Any], ImageTextDict]):
             add_generation_prompt: Whether to add generation prompt at the end
             mask_prompt: Whether to mask non-assistant tokens (set loss_mask to 0.0)
             grid_pinpoints: List of grid resolutions for anyres processing, e.g., [[384,384], [768,384], ...]
-            patch_size: Size of each image patch (default 384)
+            tile_size: Image tile size; inferred from the image processor when omitted
             vision_feature_height: Vision encoder output tokens per spatial dim (e.g., 27 for 384/14)
             max_num_patches: Maximum number of patches for anyres constraint (e.g., 9 for anyres_max_9)
         """
@@ -494,10 +499,15 @@ class BatchImageProcessor(BatchProcessor[Dict[str, Any], ImageTextDict]):
         self.add_generation_prompt = add_generation_prompt
         self.mask_prompt = mask_prompt
 
+        params = _extract_anyres_params(processor)
+        if grid_pinpoints is None:
+            grid_pinpoints = params.grid_pinpoints
         self.grid_pinpoints = grid_pinpoints
-        self.patch_size = patch_size
-        self.vision_feature_height = vision_feature_height
-        self.max_num_patches = max_num_patches
+        self.tile_size = params.tile_size if tile_size is None else tile_size
+        self.vision_feature_height = (
+            params.vision_feature_height if vision_feature_height is None else vision_feature_height
+        )
+        self.max_num_patches = params.max_num_patches if max_num_patches is None else max_num_patches
 
         if grid_pinpoints is not None:
             self._grid_h: np.ndarray | None = np.array([p[0] for p in grid_pinpoints], dtype=np.float64)
@@ -527,7 +537,7 @@ class BatchImageProcessor(BatchProcessor[Dict[str, Any], ImageTextDict]):
 
     def _compute_grid_shape(self, image_size: Tuple[int, int]) -> Tuple[int, int]:
         """Select the tile grid that preserves the most image area with least padding."""
-        if self._grid_h is None or self.patch_size is None:
+        if self._grid_h is None or self.tile_size is None:
             return (1, 1)  # Default for no anyres
 
         assert self._grid_w is not None and self._grid_area is not None
@@ -550,8 +560,8 @@ class BatchImageProcessor(BatchProcessor[Dict[str, Any], ImageTextDict]):
 
         assert self.grid_pinpoints is not None
         best_h, best_w = self.grid_pinpoints[best_idx]
-        gh = best_h // self.patch_size
-        gw = best_w // self.patch_size
+        gh = best_h // self.tile_size
+        gw = best_w // self.tile_size
         return (gh, gw)
 
     def _compute_unpad_indices_for_image(
@@ -648,15 +658,10 @@ class BatchImageProcessor(BatchProcessor[Dict[str, Any], ImageTextDict]):
         grid_mask = np.zeros(total_patches, dtype=np.bool_)
         grid_mask[:valid_patches] = True
 
-        if actual_patches < total_patches:
-            pad_size = total_patches - actual_patches
-            padding = np.zeros((pad_size,) + pixel_values.shape[1:], dtype=pixel_values.dtype)
-            pixel_values = np.concatenate([pixel_values, padding], axis=0)
-        elif actual_patches > total_patches:
-            pixel_values = pixel_values[:total_patches]
+        if actual_patches > total_patches:
             grid_mask[:] = True
 
-        return pixel_values, grid_mask
+        return _pad_or_trim_image_tiles(pixel_values, total_patches), grid_mask
 
     def _create_loss_mask(self, input_ids: np.ndarray) -> np.ndarray:
         """Select assistant content and its terminator, including truncated responses."""
@@ -704,7 +709,7 @@ class BatchImageProcessor(BatchProcessor[Dict[str, Any], ImageTextDict]):
 
         return mask.astype(np.float32)
 
-    def __call__(self, batch: Sequence[Dict[str, Any]]) -> Sequence[ImageTextDict]:
+    def __call__(self, batch: Sequence[Mapping[str, Any]]) -> Sequence[ImageTextDict]:
         """
         Process a batch of conversation data.
 
@@ -722,7 +727,7 @@ class BatchImageProcessor(BatchProcessor[Dict[str, Any], ImageTextDict]):
         for item in batch:
             if item.get("audio") or item.get("videos"):
                 raise ValueError(
-                    "BatchImageProcessor accepts images and text; use an audio/video processor for other modalities"
+                    "BatchMultimodalProcessor accepts images and text; use an audio/video processor for other modalities"
                 )
             messages = item.get(self.messages_key, [])
             images_data = item.get(self.images_key, [])
@@ -752,7 +757,7 @@ class BatchImageProcessor(BatchProcessor[Dict[str, Any], ImageTextDict]):
                 image_offset += num_images
 
         if all_images:
-            processed: BatchFeature = cast(ImageProcessorCallable, self.processor)(
+            processed: BatchFeature = cast(MultimodalProcessorCallable, self.processor)(
                 images=all_images,
                 text=all_texts,
                 return_tensors="np",
@@ -761,7 +766,7 @@ class BatchImageProcessor(BatchProcessor[Dict[str, Any], ImageTextDict]):
                 truncation=True,
             )
         else:
-            processed: BatchFeature = cast(ImageProcessorCallable, self.processor)(
+            processed: BatchFeature = cast(MultimodalProcessorCallable, self.processor)(
                 text=all_texts,
                 return_tensors="np",
                 padding=self._padding_mode,
@@ -861,17 +866,17 @@ class BatchImageProcessor(BatchProcessor[Dict[str, Any], ImageTextDict]):
             "padding": self.padding,
             "mask_prompt": self.mask_prompt,
             "max_num_patches": self.max_num_patches,
-            "patch_size": self.patch_size,
+            "tile_size": self.tile_size,
             "grid_pinpoints": self.grid_pinpoints,
             "vision_feature_height": self.vision_feature_height,
         }
 
     @property
     def output_exemplar(self) -> ImageTextDict:
-        exemplar = _image_text_cache_exemplar(self.patch_size)
+        exemplar = _image_text_cache_exemplar(self.tile_size)
         if self.max_num_patches is not None:
             total_patches = self.max_num_patches + 1
-            exemplar["pixel_values"] = np.zeros((total_patches, 3, self.patch_size, self.patch_size), dtype=np.float32)
+            exemplar["pixel_values"] = np.zeros((total_patches, 3, self.tile_size, self.tile_size), dtype=np.float32)
             exemplar["grid_mask"] = np.zeros((total_patches,), dtype=np.bool_)
             if self.grid_pinpoints and self.vision_feature_height:
                 features_per_patch = self.vision_feature_height * self.vision_feature_height
@@ -888,7 +893,7 @@ class BatchImageProcessor(BatchProcessor[Dict[str, Any], ImageTextDict]):
         return 0
 
 
-def image_caption_to_conversation(record: Dict[str, Any]) -> Dict[str, Any]:
+def image_caption_to_conversation(record: Dict[str, Any]) -> ConversationDict:
     """Represent an image-caption pair as a user image and assistant caption."""
     return {
         "messages": [
@@ -922,18 +927,11 @@ class ImageDatasetSourceConfig:
     validation_urls: List[str] = ()  # type: ignore
     cache_dir: Optional[str] = None
 
-    def get_shard_source(self, split: str) -> Optional[ShardedDataSource[Dict[str, Any]]]:
+    def get_shard_source(self, split: str) -> Optional[ShardedDataSource[ConversationDict]]:
         """Get a sharded data source for the specified split."""
         if self.id is not None:
-            try:
-                ds = WrappedHFDataSource(self.id, split=split, name=self.name, streaming=self.stream)
-            except ValueError as e:
-                if str(e).startswith("Bad split"):
-                    logger.warning(f"Split {split} not found for {self.id} {self.name}")
-                    return None
-                raise
-
-            if len(ds.shard_names) == 0:
+            ds = datasource_from_hf_or_none(self.id, split=split, name=self.name, streaming=self.stream)
+            if ds is None:
                 return None
 
             def extract_fields(x: dict[str, Any]) -> dict[str, Any]:
@@ -1030,24 +1028,12 @@ class ConversationDatasetSourceConfig:
     def get_shard_source(self, split: str) -> Optional[ShardedDataSource[ConversationDict]]:
         """Get a sharded data source for the specified split."""
         if self.id is not None:
-            try:
-                ds = WrappedHFDataSource(self.id, split=split, name=self.name, streaming=self.stream)
-            except ValueError as e:
-                if str(e).startswith("Bad split"):
-                    logger.warning(f"Split {split} not found for {self.id} {self.name}")
-                    return None
-                raise
-
-            if len(ds.shard_names) == 0:
+            ds = datasource_from_hf_or_none(self.id, split=split, name=self.name, streaming=self.stream)
+            if ds is None:
                 return None
 
             def extract_fields(x: dict[str, Any]) -> ConversationDict:
-                return {
-                    "messages": x[self.messages_key],
-                    "images": x.get(self.images_key, []),
-                    "audio": x.get("audio", []),
-                    "videos": x.get("videos", []),
-                }
+                return conversation_fields(x, self.messages_key, self.images_key)
 
             return ds.map(extract_fields)
         else:
@@ -1065,12 +1051,7 @@ class ConversationDatasetSourceConfig:
             data = datasets.load_dataset(self.id, split=split, name=self.name, streaming=self.stream)
             for raw_doc in data:
                 doc = cast(Dict[str, Any], raw_doc)
-                yield {
-                    "messages": doc[self.messages_key],
-                    "images": doc.get(self.images_key, []),
-                    "audio": doc.get("audio", []),
-                    "videos": doc.get("videos", []),
-                }
+                yield conversation_fields(doc, self.messages_key, self.images_key)
         else:
             urls = self.urls_for_split(split)
             for doc in ImageConversationUrlDataSource(
@@ -1089,7 +1070,7 @@ class ImageTaskConfig(abc.ABC):
     """Base configuration for image-text tasks."""
 
     processor: str
-    max_length: int = DEFAULT_IMAGE_TEXT_MAX_LENGTH
+    max_length: int = 2048
     padding: bool = True
 
     @cached_property
@@ -1153,9 +1134,9 @@ class OnDemandImageDataset(AsyncDataset[ImageTextDict]):
 
     def __init__(
         self,
-        source: ShardedDataSource[Dict[str, Any]],
+        source: ShardedDataSource[ConversationDict],
         processor: ProcessorMixin,
-        max_length: int = DEFAULT_IMAGE_TEXT_MAX_LENGTH,
+        max_length: int,
         padding: bool = True,
         messages_key: str = "messages",
         images_key: str = "images",
@@ -1171,26 +1152,19 @@ class OnDemandImageDataset(AsyncDataset[ImageTextDict]):
         self.images_key = images_key
         self.cache_size = cache_size
 
-        params = _extract_anyres_params(processor)
-        if max_num_patches is None:
-            max_num_patches = params.max_num_patches
-
-        self._batch_processor = BatchImageProcessor(
+        self._batch_processor = BatchMultimodalProcessor(
             processor,
             max_length=max_length,
             padding=padding,
             messages_key=messages_key,
             images_key=images_key,
-            grid_pinpoints=params.grid_pinpoints,
-            patch_size=params.patch_size,
-            vision_feature_height=params.vision_feature_height,
             max_num_patches=max_num_patches,
         )
 
         self._processor_lock = self._get_processor_lock(processor)
 
         # Raw records may include decoded images as well as paths or encoded bytes.
-        self._raw_data: Optional[List[Dict[str, Any]]] = None
+        self._raw_data: Optional[List[ConversationDict]] = None
         self._length: Optional[int] = None
         self._data_lock = threading.Lock()
         self._data_loaded = threading.Event()
@@ -1216,7 +1190,7 @@ class OnDemandImageDataset(AsyncDataset[ImageTextDict]):
 
             logger.info("Loading raw records into memory for indexed image access...")
 
-            raw_data: list[Dict[str, Any]] = []
+            raw_data: list[ConversationDict] = []
             for shard_name in self.source.shard_names:
                 shard_data = list(self.source.open_shard(shard_name))
                 raw_data.extend(shard_data)
@@ -1234,11 +1208,6 @@ class OnDemandImageDataset(AsyncDataset[ImageTextDict]):
             return
 
         def prefetch_worker() -> None:
-            """Background worker that prefetches data sequentially.
-
-            Simple sequential prefetch - processes data from index 0 to end,
-            keeping the cache filled ahead of consumption.
-            """
             batch_size = 32
             next_idx = 0
 
@@ -1359,28 +1328,21 @@ class ProcessedImageCache(AsyncDataset[ImageTextDict]):
     @staticmethod
     def build_or_load(
         cache_dir: str,
-        source: ShardedDataSource[Dict[str, Any]],
+        source: ShardedDataSource[ConversationDict],
         processor: ProcessorMixin,
-        max_length: int = DEFAULT_IMAGE_TEXT_MAX_LENGTH,
+        max_length: int,
         padding: bool = True,
         messages_key: str = "messages",
         images_key: str = "images",
         cache_options: CacheOptions = CacheOptions.default(),
         max_num_patches: Optional[int] = None,
     ) -> "ProcessedImageCache":
-        params = _extract_anyres_params(processor)
-        if max_num_patches is None:
-            max_num_patches = params.max_num_patches
-
-        batch_processor = BatchImageProcessor(
+        batch_processor = BatchMultimodalProcessor(
             processor,
             max_length=max_length,
             padding=padding,
             messages_key=messages_key,
             images_key=images_key,
-            grid_pinpoints=params.grid_pinpoints,
-            patch_size=params.patch_size,
-            vision_feature_height=params.vision_feature_height,
             max_num_patches=max_num_patches,
         )
         cache = build_or_load_cache(cache_dir, source, batch_processor, options=cache_options)
@@ -1557,15 +1519,7 @@ class ImageTextDataset(MappedAsyncDataset[ImageTextDict, ImageTextExample]):
                     dtype=pixel_dtype,
                 )
             elif pixel_array.ndim == 4:
-                actual_num_patches = pixel_array.shape[0]
-                target_num_patches = self.NumPatches.size
-
-                if actual_num_patches < target_num_patches:
-                    pad_size = target_num_patches - actual_num_patches
-                    padding = np.zeros((pad_size,) + pixel_array.shape[1:], dtype=pixel_array.dtype)
-                    pixel_array = np.concatenate([pixel_array, padding], axis=0)
-                elif actual_num_patches > target_num_patches:
-                    pixel_array = pixel_array[:target_num_patches]
+                pixel_array = _pad_or_trim_image_tiles(pixel_array, self.NumPatches.size)
 
                 if self.pixel_dtype is not None:
                     pixel_array = pixel_array.astype(pixel_dtype)
@@ -1654,8 +1608,8 @@ class ImageMixtureDatasetConfig(ImageTaskConfig):
     train_weights: Dict[str, float] = field(default_factory=dict)
     """Weights for each dataset source. They will be normalized to sum to 1."""
     shuffle: bool | int = False
-    """Whether to shuffle the dataset. True means shuffle the whole dataset, False means don't shuffle.
-    If you want to shuffle in eras, set this to the era length."""
+    """Shuffle each source before mixing: True for a full shuffle, False to preserve order,
+    or an integer for the per-source shuffle era length."""
     stop_strategy: str = field(default=StopStrategy.RESTART_STRATEGY)
     mixture_block_size: int = 2048
     """Block size for the mixture dataset."""
