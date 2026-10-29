@@ -257,16 +257,35 @@ class SiglipVisionConfig(VisionEncoderConfig["SiglipVisionModel"]):
 
     def attention_config(self) -> AttentionConfig:
         """Build the standard Levanter attention configuration for SigLIP."""
-        backend = self.attn_backend if self.use_flash_attention else AttentionBackend.VANILLA
-        return AttentionConfig(
-            Embed=self.Embed,
-            num_heads=self.num_attention_heads,
-            num_kv_heads=self.num_attention_heads,
-            use_bias=True,
-            use_output_bias=True,
-            attn_backend=backend,
-            flash_attention_block_size=self.flash_attention_block_size,
+        return siglip_attention_config(
+            self.Embed,
+            self.num_attention_heads,
+            self.attn_backend if self.use_flash_attention else AttentionBackend.VANILLA,
+            self.flash_attention_block_size,
         )
+
+
+def siglip_attention_config(
+    embed: Axis, num_heads: int, backend: AttentionBackend | None, block_size: int | None
+) -> AttentionConfig:
+    return AttentionConfig(
+        Embed=embed,
+        num_heads=num_heads,
+        num_kv_heads=num_heads,
+        use_bias=True,
+        use_output_bias=True,
+        attn_backend=backend,
+        flash_attention_block_size=block_size,
+    )
+
+
+def siglip_from_state_dict(model, state_dict: Dict[str, jnp.ndarray], prefix: Optional[str] = None):
+    # Standalone HF vision checkpoints omit the composite model's vision_model prefix.
+    if with_prefix(prefix, "embeddings.patch_embedding.weight") in state_dict:
+        vision_model = default_eqx_module_from_state_dict(model.vision_model, state_dict, prefix)
+        head = from_state_dict(model.head, state_dict, with_prefix(prefix, "head")) if model.head is not None else None
+        return replace(model, vision_model=vision_model, head=head)
+    return default_eqx_module_from_state_dict(model, state_dict, prefix)
 
 
 class SiglipBlockConfig(Protocol):
@@ -708,7 +727,6 @@ class SiglipVisionTransformer(ModuleWithStateDictSerialization):
     post_layernorm: hnn.LayerNorm
 
     def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
-        """Map Levanter field names to HuggingFace state dict keys."""
         return {"layers": "encoder.layers"}
 
     @staticmethod
@@ -811,17 +829,9 @@ class SiglipVisionModel(ModuleWithStateDictSerialization, VisionModelWithHfSeria
         return replace(output, pooler_output=pooler_output)
 
     def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
-        """Map Levanter field names to HuggingFace state dict keys."""
         return {}  # Keep vision_model prefix as-is (matches HF structure)
 
     def from_state_dict(self, state_dict: Dict[str, jnp.ndarray], prefix: Optional[str] = None) -> Self:
         """Load from state dict."""
 
-        # Standalone HF vision checkpoints omit the composite model's vision_model prefix.
-        if with_prefix(prefix, "embeddings.patch_embedding.weight") in state_dict:
-            vision_model = default_eqx_module_from_state_dict(self.vision_model, state_dict, prefix)
-            head = (
-                from_state_dict(self.head, state_dict, with_prefix(prefix, "head")) if self.head is not None else None
-            )
-            return replace(self, vision_model=vision_model, head=head)
-        return default_eqx_module_from_state_dict(self, state_dict, prefix)
+        return siglip_from_state_dict(self, state_dict, prefix)

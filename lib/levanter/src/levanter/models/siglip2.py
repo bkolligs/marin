@@ -12,10 +12,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from haliax import Axis, NamedArray
-from haliax._src.state_dict import default_eqx_module_from_state_dict
 from haliax.jax_utils import maybe_rng_split, named_call
 from haliax.nn.scan import Stacked
-from haliax.state_dict import ModuleWithStateDictSerialization, from_state_dict, with_prefix
+from haliax.state_dict import ModuleWithStateDictSerialization
 from jaxtyping import PRNGKeyArray
 
 from levanter.compat.hf_checkpoints import HfVisionCheckpointConverter, RepoRef, VisionModelWithHfSerializationMixin
@@ -28,6 +27,8 @@ from levanter.models.siglip import (
     siglip_activation,
     siglip_hidden_states,
     siglip_encoder_layers,
+    siglip_attention_config,
+    siglip_from_state_dict,
 )
 from levanter.models.vision_model import VisionEncoderConfig
 from levanter.utils.activation import ActivationFunctionEnum
@@ -234,15 +235,11 @@ class Siglip2VisionConfig(VisionEncoderConfig["Siglip2VisionModel"]):
 
     def attention_config(self) -> AttentionConfig:
         """Build the standard Levanter attention configuration for SigLIP2."""
-        backend = self.attn_backend if self.use_flash_attention else AttentionBackend.VANILLA
-        return AttentionConfig(
-            Embed=self.Embed,
-            num_heads=self.num_attention_heads,
-            num_kv_heads=self.num_attention_heads,
-            use_bias=True,
-            use_output_bias=True,
-            attn_backend=backend,
-            flash_attention_block_size=self.flash_attention_block_size,
+        return siglip_attention_config(
+            self.Embed,
+            self.num_attention_heads,
+            self.attn_backend if self.use_flash_attention else AttentionBackend.VANILLA,
+            self.flash_attention_block_size,
         )
 
 
@@ -292,9 +289,7 @@ class Siglip2VisionEmbeddings(eqx.Module):
         return Siglip2VisionEmbeddings(config, patch_embedding, position_embedding)
 
     @named_call
-    def __call__(
-        self, pixel_values: NamedArray, spatial_shapes: np.ndarray | None = None, *, key: PRNGKeyArray | None = None
-    ) -> NamedArray:
+    def __call__(self, pixel_values: NamedArray, spatial_shapes: np.ndarray | None = None) -> NamedArray:
         """
         Forward pass through vision embeddings.
 
@@ -303,7 +298,6 @@ class Siglip2VisionEmbeddings(eqx.Module):
                 where patch_input_dim = num_channels * patch_size * patch_size
             spatial_shapes: Optional array of shape (batch, 2) containing [height, width] in patches
                 for each image. If provided, position embeddings will be interpolated to match.
-            key: Optional PRNGKey (unused, kept for API compatibility)
 
         Returns:
             Embeddings with position information added
@@ -366,21 +360,10 @@ class Siglip2VisionTransformer(ModuleWithStateDictSerialization):
     post_layernorm: hnn.LayerNorm
 
     def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
-        """Map Levanter field names to HuggingFace state dict keys."""
         return {"layers": "encoder.layers"}
 
     @staticmethod
     def init(config: Siglip2VisionConfig, *, key: PRNGKeyArray) -> "Siglip2VisionTransformer":
-        """
-        Initialize Siglip2VisionTransformer.
-
-        Args:
-            config: Siglip2VisionConfig
-            key: PRNGKey for initialization
-
-        Returns:
-            Initialized Siglip2VisionTransformer module
-        """
         k_embed, k_layers = maybe_rng_split(key, 2)
 
         embeddings = Siglip2VisionEmbeddings.init(config, key=k_embed)
@@ -414,9 +397,9 @@ class Siglip2VisionTransformer(ModuleWithStateDictSerialization):
                 - last_hidden_state: Final encoded representations after post_layernorm
                 - hidden_states: Embeddings followed by every encoder layer output.
         """
-        k_embed, k_layers = maybe_rng_split(key, 2)
+        _, k_layers = maybe_rng_split(key, 2)
 
-        hidden_states = self.embeddings(pixel_values, spatial_shapes=spatial_shapes, key=k_embed)
+        hidden_states = self.embeddings(pixel_values, spatial_shapes=spatial_shapes)
 
         hidden_states, result_hidden_states = siglip_hidden_states(
             self.layers,
@@ -451,16 +434,6 @@ class Siglip2VisionModel(ModuleWithStateDictSerialization, VisionModelWithHfSeri
 
     @classmethod
     def init(cls, config: Siglip2VisionConfig, *, key: PRNGKeyArray) -> "Siglip2VisionModel":
-        """
-        Initialize Siglip2VisionModel.
-
-        Args:
-            config: Siglip2VisionConfig
-            key: PRNGKey for initialization
-
-        Returns:
-            Initialized Siglip2VisionModel
-        """
         key_vision, key_head = maybe_rng_split(key, 2)
         vision_model = Siglip2VisionTransformer.init(config, key=key_vision)
         head = SiglipMultiheadAttentionPoolingHead.init(config, key=key_head) if config.vision_use_head else None
@@ -493,17 +466,9 @@ class Siglip2VisionModel(ModuleWithStateDictSerialization, VisionModelWithHfSeri
         return replace(output, pooler_output=pooler_output)
 
     def _state_dict_key_map(self) -> Dict[str, Optional[str]]:
-        """Map Levanter field names to HuggingFace state dict keys."""
         return {}  # Keep vision_model prefix as-is (matches HF structure)
 
     def from_state_dict(self, state_dict: Dict[str, jnp.ndarray], prefix: Optional[str] = None) -> Self:
         """Load from state dict."""
 
-        # Standalone HF vision checkpoints omit the composite model's vision_model prefix.
-        if with_prefix(prefix, "embeddings.patch_embedding.weight") in state_dict:
-            vision_model = default_eqx_module_from_state_dict(self.vision_model, state_dict, prefix)
-            head = (
-                from_state_dict(self.head, state_dict, with_prefix(prefix, "head")) if self.head is not None else None
-            )
-            return replace(self, vision_model=vision_model, head=head)
-        return default_eqx_module_from_state_dict(self, state_dict, prefix)
+        return siglip_from_state_dict(self, state_dict, prefix)
