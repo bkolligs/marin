@@ -26,8 +26,9 @@ cp -R experiments/multimodality/base experiments/multimodality/my_variant
 - `train.py` owns caption preprocessing, loss, batching, and training.
 - `launch.py` owns checkpoint choices and run configuration.
 
-Relative imports keep a copied variant connected to its own files. Components
-reuse the Levanter SigLIP and Qwen3 implementations and their named arrays; this
+Update the absolute imports in a copied variant to reference its own modules,
+such as `experiments.multimodality.my_variant.model`. Components reuse the
+Levanter SigLIP and Qwen3 implementations and their named arrays; this
 template does not copy Grug's text transformer implementation. Add variant tests
 beside the variant.
 

@@ -20,7 +20,7 @@ from levanter.optim.config import AdamConfig
 from levanter.trainer import Trainer, TrainerConfig
 from transformers import PreTrainedTokenizerBase, SiglipImageProcessor
 
-from .model import Vlm, VlmConfig, load_pretrained
+from experiments.multimodality.base.model import Vlm, VlmConfig, load_pretrained
 
 
 class CaptionBatch(eqx.Module):

@@ -18,8 +18,8 @@ from levanter.tracker.tracker import NoopConfig
 from levanter.trainer import TrainerConfig
 from transformers import AutoConfig, AutoTokenizer, SiglipImageProcessor
 
-from .model import VlmConfig
-from .train import TrainConfig, train
+from experiments.multimodality.base.model import VlmConfig
+from experiments.multimodality.base.train import TrainConfig, train
 
 VISION_CHECKPOINT = "google/siglip-so400m-patch14-384@9fdffc58afc957d1a03a25b10dba0329ab15c2a3"
 TEXT_CHECKPOINT = "marin-community/delphi-3e19-998Mparams-5Btokens@1aa790e5d1e3402d4893e18b389f8bf007b8c267"
