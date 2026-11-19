@@ -32,7 +32,7 @@ from levanter.adaptor.lora import (
 )
 from levanter.callbacks import StepInfo
 from levanter.checkpoint import Checkpointer
-from levanter.compat.hf_checkpoints import HfLmCheckpointConverter
+from levanter.compat.hf_checkpoints import HfLanguageCheckpointConverter
 from levanter.layers.attention import AttentionMask
 from levanter.models.gpt2 import Gpt2Config, Gpt2LMHeadModel
 from levanter.models.llama import LlamaConfig, LlamaLMHeadModel
@@ -162,7 +162,9 @@ def test_lora_load_in_peft(local_gpt2_tokenizer_path):
 
     # Local tokenizer keeps converter construction off the Hub; the base model is
     # saved/reloaded from a temp dir so the tokenizer is incidental here.
-    converter: HfLmCheckpointConverter = Gpt2Config(tokenizer=local_gpt2_tokenizer_path).hf_checkpoint_converter()
+    converter: HfLanguageCheckpointConverter = Gpt2Config(
+        tokenizer=local_gpt2_tokenizer_path
+    ).hf_checkpoint_converter()
     config = Gpt2Config(max_seq_len=128, hidden_dim=128, num_layers=2, num_heads=2)
     Vocab = converter.Vocab
 
@@ -214,7 +216,9 @@ def test_lora_merged_load_in_hf(local_gpt2_tokenizer_path):
 
     # Local tokenizer keeps converter construction off the Hub; the base model is
     # saved/reloaded from a temp dir so the tokenizer is incidental here.
-    converter: HfLmCheckpointConverter = Gpt2Config(tokenizer=local_gpt2_tokenizer_path).hf_checkpoint_converter()
+    converter: HfLanguageCheckpointConverter = Gpt2Config(
+        tokenizer=local_gpt2_tokenizer_path
+    ).hf_checkpoint_converter()
     config = Gpt2Config(max_seq_len=128, hidden_dim=128, num_layers=2, num_heads=2)
     Vocab = converter.Vocab
 
@@ -271,7 +275,7 @@ def test_lora_merged_load_in_hf_llama():
         gradient_checkpointing=False,
         scan_layers=False,
     )
-    converter: HfLmCheckpointConverter = config.hf_checkpoint_converter()
+    converter: HfLanguageCheckpointConverter = config.hf_checkpoint_converter()
     vocab = hax.Axis("vocab", 128)
 
     model = LlamaLMHeadModel.init(vocab, config=config, key=jax.random.PRNGKey(0))
