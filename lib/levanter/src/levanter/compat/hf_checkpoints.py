@@ -1387,7 +1387,7 @@ class HfLmCheckpointConverter(HfCheckpointIO[MConfig]):
 
 
 @dataclass_with_default_init(frozen=True)
-class VisionLanguageCheckpointConverter(HfCheckpointIO[VisionConfig]):
+class HfVisionLanguageCheckpointConverter(HfCheckpointIO[VisionConfig]):
     """Convert vision checkpoints without language-model vocabulary or tokenizer state."""
 
     def __init__(
