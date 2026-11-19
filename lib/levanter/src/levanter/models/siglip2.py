@@ -17,7 +17,11 @@ from haliax.nn.scan import Stacked
 from haliax.state_dict import ModuleWithStateDictSerialization
 from jaxtyping import PRNGKeyArray
 
-from levanter.compat.hf_checkpoints import HfVisionCheckpointConverter, RepoRef, VisionModelWithHfSerializationMixin
+from levanter.compat.hf_checkpoints import (
+    VisionLanguageCheckpointConverter,
+    RepoRef,
+    VisionModelWithHfSerializationMixin,
+)
 from levanter.layers.attention import AttentionBackend, AttentionConfig, AttentionMask
 from levanter.models.siglip import (
     DEFAULT_SIGLIP_INITIALIZER_RANGE,
@@ -114,10 +118,10 @@ class Siglip2VisionConfig(VisionEncoderConfig["Siglip2VisionModel"]):
 
     def hf_checkpoint_converter(
         self, ref_checkpoint: Optional[str] = None
-    ) -> HfVisionCheckpointConverter["Siglip2VisionConfig"]:
+    ) -> VisionLanguageCheckpointConverter["Siglip2VisionConfig"]:
         """Create HuggingFace checkpoint converter for this config."""
         reference = self.reference_checkpoint if ref_checkpoint is None else ref_checkpoint
-        return HfVisionCheckpointConverter(
+        return VisionLanguageCheckpointConverter(
             self.__class__,
             reference_checkpoint=RepoRef.from_string(reference) if reference is not None else None,
             trust_remote_code=False,

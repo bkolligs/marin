@@ -36,7 +36,7 @@ from haliax.state_dict import (  # noqa: E402
 )
 
 from levanter.compat.hf_checkpoints import (  # noqa: E402
-    HfVisionCheckpointConverter,
+    VisionLanguageCheckpointConverter,
     RepoRef,
     VisionModelWithHfSerializationMixin,
 )
@@ -124,10 +124,10 @@ class SiglipVisionConfig(VisionEncoderConfig["SiglipVisionModel"]):
 
     def hf_checkpoint_converter(
         self, ref_checkpoint: Optional[str] = None
-    ) -> HfVisionCheckpointConverter["SiglipVisionConfig"]:
+    ) -> VisionLanguageCheckpointConverter["SiglipVisionConfig"]:
         """Create HuggingFace checkpoint converter for this config."""
         reference = self.reference_checkpoint if ref_checkpoint is None else ref_checkpoint
-        return HfVisionCheckpointConverter(
+        return VisionLanguageCheckpointConverter(
             self.__class__,
             reference_checkpoint=RepoRef.from_string(reference) if reference is not None else None,
             trust_remote_code=False,

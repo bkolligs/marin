@@ -105,27 +105,7 @@ ensure that `out_first=True` is set on Linear modules if they're going to be loa
 
 ### Hugging Face checkpoint converters
 
-Language models use `HfLmCheckpointConverter` from `levanter.compat.hf_checkpoints`.
-It owns tokenizer metadata, vocabulary resizing, and initialization through
-`Model.init(Vocab, config, key=key)`. Update imports of the former
-`HFCheckpointConverter` name; there is no compatibility alias.
-
-Vision encoders use `HfVisionCheckpointConverter` and
-`VisionModelWithHfSerializationMixin`. Vision model classes initialize through
-`Model.init(config, key=key)`, and their config implements
-`to_hf_config(config_overrides=None)` and `from_hf_config(hf_config)`.
-Pass vision checkpoint references as `RepoRef(model_name_or_path, revision=None)`.
-Both converters share checkpoint I/O and shard export through `HfCheckpointIO`.
-
-For example, load and export a local SigLIP checkpoint with:
-
-```python
-from levanter.models.siglip import SiglipVisionConfig, SiglipVisionModel
-
-converter = SiglipVisionConfig().hf_checkpoint_converter("/path/to/checkpoint")
-model = converter.load_pretrained(SiglipVisionModel)
-converter.save_pretrained(model, "/path/to/export", save_reference_code=False)
-```
+Use `HfLmCheckpointConverter` for language models and `VisionLanguageCheckpointConverter` for vision encoders. Load weights with `converter.load_pretrained(model_cls)` and export them with `converter.save_pretrained(model, path)`. For a vision encoder, save the matching processor separately if you need it for inference.
 
 ### Serialization to/from State Dicts
 
